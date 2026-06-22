@@ -1,0 +1,20 @@
+name: secondary-structure-project
+
+channels:
+  - conda-forge
+  - bioconda
+
+channel_priority: strict
+
+dependencies:
+  - python=3.10
+  - git
+  - pandas
+  - numpy
+  - scikit-learn
+  - tqdm
+  - docopt
+  - procps-ng
+  - matplotlib
+  - nextflow
+  - biopython
