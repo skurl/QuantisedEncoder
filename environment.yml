@@ -19,3 +19,4 @@ dependencies:
   - nextflow
   - biopython
   - datasets
+  - mmseqs2

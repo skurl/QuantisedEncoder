@@ -1,4 +1,4 @@
-import math, json, random, copy, time, itertools
+import math, json, random, copy, time
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +11,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
-from datasets import load_dataset
 
 device = (torch.accelerator.current_accelerator().type
           if hasattr(torch, "accelerator") and torch.accelerator.is_available()
@@ -22,8 +21,7 @@ print(f"Using: {device}\n")
 @dataclass
 class ModelArgs:
     out_dir = "./outputs"
-    hf_dataset = "Synthyra/uniref50"
-    subset_size = 100_000   # first representative subset; scale up later
+    data_file = "./data/fungi_clustered.fasta"   # built by import_fasta.py (40%-identity reps)
     length_cutoff = 512
     split_ratios = (0.8, 0.1, 0.1)
     split_seed = 1234
@@ -50,22 +48,32 @@ class ModelArgs:
     eval_mask_seed = 999
 
 
-# DATA  (UniRef50 via HuggingFace streaming)
+# DATA  (40%-identity fungal cluster representatives, prepared by import_fasta.py)
 
-def load_sequences(name, n, cutoff):
-    stream = iter(load_dataset(name, split="train", streaming=True).take(n))
-    first = next(stream)
-    # ponytail: assume "sequence" column, else first string field. UniRef50 schema is stable.
-    key = "sequence" if "sequence" in first else next(k for k, v in first.items() if isinstance(v, str))
-    seqs = []
-    for ex in itertools.chain([first], stream):
-        s = ex[key].upper().replace("*", "")
-        if len(s) < cutoff:
-            seqs.append(s)
+def read_fasta(lines):
+    seq = []
+    for line in lines:
+        if line.startswith(">"):
+            if seq:
+                yield "".join(seq)
+                seq = []
+        else:
+            seq.append(line.strip())
+    if seq:
+        yield "".join(seq)
+
+
+def load_sequences(path, cutoff):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} missing - run `python bin/import_fasta.py` first to build it")
+    with open(path) as fh:
+        seqs = [s.upper().replace("*", "") for s in read_fasta(fh)]
+    seqs = [s for s in seqs if 0 < len(s) < cutoff]
     return sorted(set(seqs))
 
 
-# SPLIT  (UniRef50 is pre-clustered at 50% identity -> plain random split is leakage-safe)
+# SPLIT  (random since the data is clustered)
 
 def random_split(n, ratios, seed):
     idx = list(range(n))
@@ -118,7 +126,7 @@ def precompute(seqs, seed):
     return [mask_sequence(s, rng) for s in seqs]
 
 
-# MODEL  (RoPE + pre-norm + SDPA)
+# MODEL  (RoPE + pre-norm + nn.SDPA)
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, max_len=2048, base=10000):
@@ -192,7 +200,7 @@ class EncoderLayer(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, arch):
         super().__init__()
-        self.arch = dict(arch)            # stored so checkpoints are self-describing
+        self.arch = dict(arch)            # stored so checkpoints are self-describing and can be reused
         self.pad_idx = arch["pad_idx"]
         self.embed = nn.Embedding(arch["vocab_size"], arch["d_model"], padding_idx=arch["pad_idx"])
         self.layers = nn.ModuleList([EncoderLayer(arch["d_model"], arch["num_heads"],
@@ -229,14 +237,13 @@ def build_arch(vocab_size, num_classes, pad_idx):
             "num_classes": num_classes, "pad_idx": pad_idx}
 
 
-def save_checkpoint(path, model, vocab, classes):
-    # self-describing: arch + vocab travel with the weights, so quantise/analyze never re-guess the config
+def save_checkpoint(path, model, vocab, classes):     # self-describing: arch + vocab travel with the weights, so quantise/analyze never re-guess the config
     torch.save({"arch": model.arch, "model": model.state_dict(),
                 "vocab": list(vocab), "classes": list(classes)}, path)
 
 
 def load_checkpoint(path, map_location="cpu"):
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)  # ponytail: our own trusted file
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model = Transformer(ckpt["arch"]).to(map_location)
     model.load_state_dict(ckpt["model"])
     return model, ckpt["vocab"], ckpt["classes"]
@@ -366,7 +373,7 @@ def train(model, train_loader, seed):
     return model
 
 
-# ANALYSIS
+# ANALYSIS (I dont really use it for the AA class but here is is just in case, BLOSUM62 is better)
 
 def unigram_baseline():
     counts = Counter(aa for s in train_seqs for aa in s if aa in output_stoi)
@@ -441,10 +448,10 @@ def blosum_correlation(model):
     return {"spearman_offdiag": _spearman(conf[iu], B[iu]), "aas": aas, "model_matrix": conf.tolist()}
 
 
-# RUN  (guarded so `import runner` is cheap and side-effect free for quantise/analyze)
+# RUN  (only runs when the runner.py is called directly, rest can be reused in other scripts)
 
 if __name__ == "__main__":
-    sequences = load_sequences(ModelArgs.hf_dataset, ModelArgs.subset_size, ModelArgs.length_cutoff)
+    sequences = load_sequences(ModelArgs.data_file, ModelArgs.length_cutoff)
     print("Number of unique sequences:", len(sequences))
 
     # VOCAB
