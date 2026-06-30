@@ -7,7 +7,7 @@ DATA = Path("./data")
 RAW_GZ = DATA / "fungi_reviewed.fasta.gz"
 RAW = DATA / "fungi_reviewed.fasta"
 OUT = DATA / "fungi_clustered.fasta"
-MIN_ID = 0.4    # 40% identity
+MIN_ID = 0.5    # 50% identity
 COV = 0.8       # min alignment coverage
 
 

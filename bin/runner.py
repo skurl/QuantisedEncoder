@@ -21,18 +21,18 @@ print(f"Using: {device}\n")
 @dataclass
 class ModelArgs:
     out_dir = "./outputs"
-    data_file = "./data/fungi_clustered.fasta"   # built by import_fasta.py (40%-identity reps)
+    data_file = "./data/fungi_clustered.fasta"   # built by import_fasta.py (50%-identity reps)
     length_cutoff = 512
     split_ratios = (0.8, 0.1, 0.1)
     split_seed = 1234
     mask_rate = 0.15
     d_model = 256
     num_heads = 8
-    num_layers = 12
+    num_layers = 6 # changed for now, because the current dataset is tiny (13k sequences), 2.9 mln tokens total
     d_ff = 4 * 256
     dropout = 0   # Dropout = 0 in the ESM paper, but with a smaller dataset it may overfit
     batch_size = 64 # changed from 64
-    num_epochs = 100
+    num_epochs = 200
     learning_rate = 1e-3
     weight_decay = 1e-2
     label_smoothing = 0.05
@@ -48,7 +48,7 @@ class ModelArgs:
     eval_mask_seed = 999
 
 
-# DATA  (40%-identity fungal cluster representatives, prepared by import_fasta.py)
+# DATA  (clustered fungal proteomes from import_fasta.py)
 
 def read_fasta(lines):
     seq = []
