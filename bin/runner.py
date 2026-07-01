@@ -11,10 +11,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
-device = (torch.accelerator.current_accelerator().type
-          if hasattr(torch, "accelerator") and torch.accelerator.is_available()
-          else ("cuda" if torch.cuda.is_available() else "cpu"))
+device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using: {device}\n")
 
 
@@ -31,7 +30,7 @@ class ModelArgs:
     num_layers = 6 # changed for now, because the current dataset is tiny (13k sequences), 2.9 mln tokens total
     d_ff = 4 * 256
     dropout = 0   # Dropout = 0 in the ESM paper, but with a smaller dataset it may overfit
-    batch_size = 64 # changed from 64
+    batch_size = 32 # changed from 64
     num_epochs = 200
     learning_rate = 1e-3
     weight_decay = 1e-2
@@ -249,34 +248,7 @@ def load_checkpoint(path, map_location="cpu"):
     return model, ckpt["vocab"], ckpt["classes"]
 
 
-# EMA + SCHEDULER
-
-class EMA:
-    def __init__(self, model, decay):
-        self.decay = decay
-        self.shadow = {n: p.detach().clone().float() for n, p in model.named_parameters() if p.requires_grad}
-        self._backup = {}
-
-    @torch.no_grad()
-    def update(self, model):
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                self.shadow[n].mul_(self.decay).add_(p.detach().float(), alpha=1 - self.decay)
-
-    @torch.no_grad()
-    def apply_shadow(self, model):
-        for n, p in model.named_parameters():
-            if n in self.shadow:
-                self._backup[n] = p.detach().clone()
-                p.data.copy_(self.shadow[n].to(p.dtype))
-
-    @torch.no_grad()
-    def restore(self, model):
-        for n, p in model.named_parameters():
-            if n in self._backup:
-                p.data.copy_(self._backup[n])
-        self._backup = {}
-
+# SCHEDULER
 
 def make_scheduler(opt, warmup, total, min_ratio):
     def lr_lambda(step):
@@ -325,7 +297,7 @@ def train(model, train_loader, seed):
     steps_per_epoch = math.ceil(len(train_loader) / ModelArgs.grad_accum)
     total_steps = steps_per_epoch * ModelArgs.num_epochs
     sched = make_scheduler(opt, ModelArgs.warmup_steps, total_steps, ModelArgs.min_lr_ratio)
-    ema = EMA(model, ModelArgs.ema_decay) if ModelArgs.use_ema else None
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ModelArgs.ema_decay)) if ModelArgs.use_ema else None
 
     best_val, best_state = float("inf"), copy.deepcopy(model.state_dict())
     global_step, tic, tok_acc = 0, time.time(), torch.zeros((), device=device)
@@ -346,7 +318,7 @@ def train(model, train_loader, seed):
                 opt.zero_grad()
                 sched.step()
                 if ema:
-                    ema.update(model)
+                    ema.update_parameters(model)
                 global_step += 1
                 if global_step % ModelArgs.log_every == 0:
                     el = time.time() - tic
@@ -355,16 +327,13 @@ def train(model, train_loader, seed):
                           f"{tok_acc.item()/max(el,1e-6):.0f} tok/s | eta {eta:.1f}m")
                     tic, _ = time.time(), tok_acc.zero_()
 
-        if ema:
-            ema.apply_shadow(model)
-        val = evaluate(model, val_loader)
+        eval_model = ema.module if ema else model
+        val = evaluate(eval_model, val_loader)
         improved = val["nll"] < best_val - 1e-4
         if improved:
             best_val = val["nll"]
-            best_state = copy.deepcopy(model.state_dict())
-            save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", model, aa_vocab, classes)
-        if ema:
-            ema.restore(model)
+            best_state = copy.deepcopy(eval_model.state_dict())
+            save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", eval_model, aa_vocab, classes)
         print(f"  epoch {epoch+1:3d} | val ppl {val['perplexity']:.3f} | "
               f"top1 {val['top1']:.2f}% | top3 {val['top3']:.2f}% | top5 {val['top5']:.2f}% "
               f"{'*' if improved else ''}")
