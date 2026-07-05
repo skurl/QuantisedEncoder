@@ -20,3 +20,4 @@ dependencies:
   - biopython
   - datasets
   - mmseqs2
+  - wandb

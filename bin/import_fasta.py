@@ -2,11 +2,11 @@ import gzip, shutil, subprocess, sys, urllib.request
 from pathlib import Path
 
 URL = ("https://rest.uniprot.org/uniprotkb/stream?compressed=true&format=fasta"
-       "&query=%28%28taxonomy_id%3A4751%29+AND+%28reviewed%3Atrue%29%29") # imports all the fungal +. reviewed proteomes
+       "&query=%28%28taxonomy_id%3A2759%29+AND+%28reviewed%3Atrue%29%29") # imports all the eukaryotic +. reviewed proteomes
 DATA = Path("./data")
-RAW_GZ = DATA / "fungi_reviewed.fasta.gz"
-RAW = DATA / "fungi_reviewed.fasta"
-OUT = DATA / "fungi_clustered.fasta"
+RAW_GZ = DATA / "eukaryote_reviewed.fasta.gz"
+RAW = DATA / "eukaryote_reviewed.fasta"
+OUT = DATA / "eukaryote_clustered.fasta"
 MIN_ID = 0.5    # 50% identity
 COV = 0.8       # min alignment coverage
 
@@ -27,7 +27,7 @@ def main():
     if not RAW.exists():
         with gzip.open(RAW_GZ, "rt") as f, open(RAW, "w") as g:
             shutil.copyfileobj(f, g)
-    print(f"[1/3] {count_seqs(RAW)} reviewed fungal proteins")
+    print(f"[1/3] {count_seqs(RAW)} reviewed eukaryotic proteins")
 
     print(f"[2/3] clustering at {MIN_ID:.0%} identity (MMseqs2, coverage {COV:.0%})")
     prefix, tmp = DATA / "clust", DATA / "mmseqs_tmp"
