@@ -1,4 +1,4 @@
-import copy, json, sys
+import argparse, copy, json, sys
 from functools import partial
 from pathlib import Path
 
@@ -7,10 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from runner import (ModelArgs, device, load_checkpoint, load_sequences, random_split,
-                    precompute, pad_batch, evaluate, biochemical_breakdown, blosum_correlation, embed)
+from core import (ModelArgs, device, load_checkpoint, load_sequences, random_split,
+                  precompute, pad_batch, evaluate, biochemical_breakdown, blosum_correlation, embed)
 
 BITS = [8, 4, 3, 2]
+TEST_SIZE = 4000   # cap the test set for the sweep (quant deltas are tight well before the full 84k)
 
 
 def fake_quant_weight(w, bits):   # native op == the one QAT uses (straight-through backward)
@@ -43,7 +44,7 @@ def default_ckpts():
         return [str(d / "model_best.pth")]
     cands = sorted(d.glob("best_seed*.pth"))
     if not cands:
-        sys.exit(f"no checkpoint in {d} - train first with `python bin/runner.py`")
+        sys.exit(f"no checkpoint in {d} - train first with `python bin/train.py`")
     return [str(cands[-1])]
 
 
@@ -59,7 +60,7 @@ def sweep(ckpt):
     nparams = sum(p.numel() for p in model.parameters()) / 1e6
     seqs = load_sequences(ModelArgs.data_file, ModelArgs.length_cutoff)
     _, _, te = random_split(len(seqs), ModelArgs.split_ratios, ModelArgs.split_seed)
-    test_seqs = [seqs[i] for i in te]
+    test_seqs = [seqs[i] for i in te[:TEST_SIZE]]
     loader = DataLoader(precompute(test_seqs, ModelArgs.eval_mask_seed + 1, vocab),
                         batch_size=ModelArgs.batch_size, shuffle=False, collate_fn=partial(pad_batch, vocab=vocab))
     fp_emb = embed(model, test_seqs, vocab)   # reference embeddings
@@ -78,7 +79,13 @@ def sweep(ckpt):
 
 def main():
     check()
-    ckpts = sys.argv[1:] or default_ckpts()
+    p = argparse.ArgumentParser()
+    p.add_argument("checkpoints", nargs="*")
+    p.add_argument("--data_file"); p.add_argument("--out_dir")
+    a = p.parse_args()
+    if a.data_file: ModelArgs.data_file = a.data_file
+    if a.out_dir: ModelArgs.out_dir = a.out_dir
+    ckpts = a.checkpoints or default_ckpts()
     allres = [sweep(c) for c in ckpts]
     out = Path(ModelArgs.out_dir) / "quant_results.json"
     out.write_text(json.dumps(allres, indent=2))

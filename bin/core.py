@@ -1,57 +1,58 @@
-import math, json, random, copy, time
+import math, random
 from collections import defaultdict, Counter
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from torch.utils.data import Sampler
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using: {device}\n")
 
 
 @dataclass
 class ModelArgs:
     out_dir = "./outputs"
-    data_file = "./data/fungi_clustered.fasta"   # built by import_fasta.py (50%-identity reps)
+    data_file = "./data/fungi_clustered.fasta"
     length_cutoff = 512
     split_ratios = (0.8, 0.1, 0.1)
     split_seed = 1234
     mask_rate = 0.15
     d_model = 256
     num_heads = 8
-    num_layers = 6 # changed for now, because the current dataset is tiny (13k sequences), 2.9 mln tokens total
+    num_layers = 6
     d_ff = 4 * 256
-    dropout = 0   # Dropout = 0 in the ESM paper, but with a smaller dataset it may overfit
-    batch_size = 32 # changed from 64
-    num_epochs = 200
+    dropout = 0
+    batch_size = 32
+    length_batching = True    # group similar-length sequences per batch -> less padding waste
+    max_steps = 5000
+    eval_every = 250          # eval + checkpoint cadence, in optimizer steps
     learning_rate = 1e-3
     weight_decay = 1e-2
     label_smoothing = 0.05
     grad_clip = 1.0
-    grad_accum = 4 # this one might be interesting to tweak as well
-    warmup_steps = 1000
+    grad_accum = 4
+    warmup_steps = 250        # ~5% of max_steps
     min_lr_ratio = 0.1
     use_ema = True
     ema_decay = 0.999
     amp = True
     log_every = 100
-    seeds = (42, )
+    seed = 42
     eval_mask_seed = 999
+    use_wandb = True
+    wandb_project = "quantised-encoder"
+    run_name = None
+    wandb_group = None
 
 STANDARD_AA = "ACDEFGHIKLMNPQRSTVWY"
 SPECIALS = ["<pad>", "<mask>", "<cls>", "<unk>", "<eos>"]
 
 
-# VOCAB  (rewritten as an object to make it easier to pass around, and to store the amino acid classes for analysis)
+# VOCAB
 
 @dataclass
 class Vocab:
@@ -106,7 +107,7 @@ def random_split(n, ratios, seed):
     return groups
 
 
-# MASKING
+# MASKING  (take the Vocab explicitly)
 
 def mask_sequence(seq, rng, vocab):
     ids, labels = [vocab.cls], [-100]
@@ -148,7 +149,24 @@ def precompute(seqs, seed, vocab):
     return [mask_sequence(s, rng, vocab) for s in seqs]
 
 
-# MODEL
+class LengthBatchSampler(Sampler):
+    """Batches of similar-length sequences (less padding). Sorts by length with a small jitter,
+    chunks into batches, then shuffles batch ORDER each epoch so gradients stay stochastic."""
+    def __init__(self, lengths, batch_size, seed=0):
+        self.lengths, self.bs = lengths, batch_size
+        self.rng = random.Random(seed)
+
+    def __iter__(self):
+        order = sorted(range(len(self.lengths)), key=lambda i: (self.lengths[i], self.rng.random()))
+        batches = [order[i:i + self.bs] for i in range(0, len(order), self.bs)]
+        self.rng.shuffle(batches)
+        return iter(batches)
+
+    def __len__(self):
+        return (len(self.lengths) + self.bs - 1) // self.bs
+
+
+# MODEL  (RoPE + pre-norm + SDPA)
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, max_len=2048, base=10000):
@@ -251,7 +269,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer(x, attention_mask)
         x = self.final_norm(x)
-        return x if return_repr else self.fc(x)   # return_repr for per-residue embeddings, before the head, for export
+        return x if return_repr else self.fc(x)
 
 
 def build_arch(vocab):
@@ -272,7 +290,7 @@ def load_checkpoint(path, map_location="cpu"):
     return model, Vocab(ckpt["vocab"], ckpt["classes"])
 
 
-# EMBEDDINGS
+# EMBEDDINGS  (unmasked full sequences -> mean-pooled per-protein vectors)
 
 @torch.no_grad()
 def embed(model, seqs, vocab, batch_size=64):
@@ -283,27 +301,16 @@ def embed(model, seqs, vocab, batch_size=64):
         lengths = torch.tensor([len(t) for t in ids])
         x = pad_sequence([torch.tensor(t) for t in ids], batch_first=True, padding_value=vocab.pad).to(device)
         attn = (torch.arange(x.size(1))[None, :] < lengths[:, None]).to(device)
-        rep = model(x, attn, return_repr=True)                      # (B, L, d_model)
+        rep = model(x, attn, return_repr=True)
         valid = attn.clone()
         valid[:, 0] = False                                         # drop <cls> (untrained here)
         valid[torch.arange(len(ids)), lengths - 1] = False          # drop <eos>
         mask = valid.unsqueeze(-1).float()
         out.append(((rep * mask).sum(1) / mask.sum(1).clamp(min=1)).cpu())
-    return torch.cat(out)                                           # (N, d_model)
+    return torch.cat(out)
 
 
-# SCHEDULER
-
-def make_scheduler(opt, warmup, total, min_ratio):
-    def lr_lambda(step):
-        if step < warmup:
-            return (step + 1) / max(1, warmup)
-        prog = (step - warmup) / max(1, total - warmup)
-        return max(min_ratio, 0.5 * (1 + math.cos(math.pi * prog)))
-    return optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-
-
-# TRAIN + EVAL
+# EVAL + ANALYSIS
 
 @torch.no_grad()
 def evaluate(model, loader, vocab):
@@ -333,60 +340,6 @@ def evaluate(model, loader, vocab):
     return {"nll": nll, "perplexity": math.exp(nll),
             "top1": 100 * t1.item() / n, "top3": 100 * t3.item() / n, "top5": 100 * t5.item() / n}
 
-
-def train(model, train_loader, val_loader, vocab, seed):
-    model.to(device)
-    crit = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=ModelArgs.label_smoothing)
-    opt = optim.AdamW(model.parameters(), lr=ModelArgs.learning_rate, weight_decay=ModelArgs.weight_decay)
-    steps_per_epoch = math.ceil(len(train_loader) / ModelArgs.grad_accum)
-    total_steps = steps_per_epoch * ModelArgs.num_epochs
-    sched = make_scheduler(opt, ModelArgs.warmup_steps, total_steps, ModelArgs.min_lr_ratio)
-    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ModelArgs.ema_decay)) if ModelArgs.use_ema else None
-
-    best_val, best_state = float("inf"), copy.deepcopy(model.state_dict())
-    global_step, tic, tok_acc = 0, time.time(), torch.zeros((), device=device)
-
-    for epoch in range(ModelArgs.num_epochs):
-        model.train()
-        opt.zero_grad()
-        for step, (x, y, attn) in enumerate(train_loader):
-            x, y, attn = x.to(device), y.to(device), attn.to(device).bool()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                enabled=(ModelArgs.amp and device == "cuda")):
-                loss = crit(model(x, attn).reshape(-1, vocab.num_classes), y.reshape(-1)) / ModelArgs.grad_accum
-            loss.backward()
-            tok_acc += (y != -100).sum()
-            if (step + 1) % ModelArgs.grad_accum == 0 or (step + 1) == len(train_loader):
-                clip_grad_norm_(model.parameters(), ModelArgs.grad_clip)
-                opt.step()
-                opt.zero_grad()
-                sched.step()
-                if ema:
-                    ema.update_parameters(model)
-                global_step += 1
-                if global_step % ModelArgs.log_every == 0:
-                    el = time.time() - tic
-                    eta = (total_steps - global_step) * (el / ModelArgs.log_every) / 60
-                    print(f"  step {global_step:6d}/{total_steps} | lr {sched.get_last_lr()[0]:.2e} | "
-                          f"{tok_acc.item()/max(el,1e-6):.0f} tok/s | eta {eta:.1f}m")
-                    tic, _ = time.time(), tok_acc.zero_()
-
-        eval_model = ema.module if ema else model
-        val = evaluate(eval_model, val_loader, vocab)
-        improved = val["nll"] < best_val - 1e-4
-        if improved:
-            best_val = val["nll"]
-            best_state = copy.deepcopy(eval_model.state_dict())
-            save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", eval_model, vocab)
-        print(f"  epoch {epoch+1:3d} | val ppl {val['perplexity']:.3f} | "
-              f"top1 {val['top1']:.2f}% | top3 {val['top3']:.2f}% | top5 {val['top5']:.2f}% "
-              f"{'*' if improved else ''}")
-
-    model.load_state_dict(best_state)
-    return model
-
-
-# ANALYSIS (I dont really use it for the AA class but here is is just in case, BLOSUM62 is better)
 
 def unigram_baseline(train_seqs, test_data, vocab):
     counts = Counter(aa for s in train_seqs for aa in s if aa in vocab.out_stoi)
@@ -460,64 +413,3 @@ def blosum_correlation(model, loader, vocab):
     B = np.array([[blosum[a, b] for b in aas] for a in aas], dtype=float)
     iu = np.triu_indices(nc, k=1)
     return {"spearman_offdiag": _spearman(conf[iu], B[iu]), "aas": aas, "model_matrix": conf.tolist()}
-
-
-# RUN  (only runs when the runner.py is called directly, rest can be reused in other scripts)
-
-if __name__ == "__main__":
-    seqs = load_sequences(ModelArgs.data_file, ModelArgs.length_cutoff)
-    print("Number of unique sequences:", len(seqs))
-    vocab = Vocab.from_sequences(seqs)
-    print(f"Vocab: {len(vocab.aa_vocab)} tokens, {vocab.num_classes} output classes\n")
-
-    tr, va, te = random_split(len(seqs), ModelArgs.split_ratios, ModelArgs.split_seed)
-    train_seqs = [seqs[i] for i in tr]
-    val_seqs = [seqs[i] for i in va]
-    test_seqs = [seqs[i] for i in te]
-
-    val_loader = DataLoader(precompute(val_seqs, ModelArgs.eval_mask_seed, vocab),
-                            batch_size=ModelArgs.batch_size, shuffle=False, collate_fn=partial(pad_batch, vocab=vocab))
-    test_data = precompute(test_seqs, ModelArgs.eval_mask_seed + 1, vocab)
-    test_loader = DataLoader(test_data, batch_size=ModelArgs.batch_size, shuffle=False,
-                             collate_fn=partial(pad_batch, vocab=vocab))
-
-    Path(ModelArgs.out_dir).mkdir(parents=True, exist_ok=True)
-    base = unigram_baseline(train_seqs, test_data, vocab)
-    print(f"\n[baseline] unigram  top1 {base['top1']:.2f}%  ppl {base['perplexity']:.3f}")
-
-    arch = build_arch(vocab)
-    runs, best = [], None
-    for seed in ModelArgs.seeds:
-        print(f"\n===== seed {seed} =====")
-        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-        g = torch.Generator(); g.manual_seed(seed)
-        train_loader = DataLoader(train_seqs, batch_size=ModelArgs.batch_size, shuffle=True,
-                                  collate_fn=partial(train_collate, vocab=vocab), generator=g)
-        model = Transformer(arch)
-        if seed == ModelArgs.seeds[0]:
-            print(f"[model] {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
-        model = train(model, train_loader, val_loader, vocab, seed)
-        tm = evaluate(model, test_loader, vocab)
-        tm["seed"] = seed
-        print(f"  TEST seed {seed}  top1 {tm['top1']:.2f}%  ppl {tm['perplexity']:.3f}")
-        runs.append(tm)
-        if best is None or tm["top1"] > best[0]:
-            best = (tm["top1"], model)
-
-    agg = {k: {"mean": float(np.mean([r[k] for r in runs])), "std": float(np.std([r[k] for r in runs]))}
-           for k in ["top1", "top3", "top5", "perplexity", "nll"]}
-    bio = biochemical_breakdown(best[1], test_loader, vocab)
-    blosum = blosum_correlation(best[1], test_loader, vocab)
-
-    print("\n================  SUMMARY  ================")
-    print(f"unigram   top1 {base['top1']:.2f}%  ppl {base['perplexity']:.3f}")
-    print(f"model     top1 {agg['top1']['mean']:.2f}±{agg['top1']['std']:.2f}%  "
-          f"ppl {agg['perplexity']['mean']:.3f}±{agg['perplexity']['std']:.3f}")
-    print(f"[biochem] class-accuracy {bio['biochemical_class_accuracy']:.2f}%")
-    print(f"[blosum]  off-diagonal Spearman vs BLOSUM62: {blosum['spearman_offdiag']:.3f}")
-
-    save_checkpoint(Path(ModelArgs.out_dir) / "model_best.pth", best[1], vocab)
-    with open(Path(ModelArgs.out_dir) / "results.json", "w") as fh:
-        json.dump({"baseline": base, "per_seed": runs, "aggregate": agg,
-                   "biochemistry": bio, "blosum": blosum}, fh, indent=2)
-    print(f"\nSaved model_best.pth and results.json to {ModelArgs.out_dir}")
