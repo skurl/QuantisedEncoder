@@ -93,26 +93,27 @@ def train(model, train_loader, val_loader, vocab, seed):
     return model
 
 
-def parse_args():
+def _coerce(default, raw):        # wandb agent passes every arg as a --key=value string
+    if isinstance(default, bool): return raw.lower() in ("1", "true", "yes")
+    if isinstance(default, int):  return int(raw)
+    if isinstance(default, float): return float(raw)
+    return raw                    # str, or None-defaulted (run_name/wandb_group)
+
+
+def parse_args():                 # accept EVERY sweepable ModelArgs field, typed off its default
+    fields = {k: v for k, v in vars(ModelArgs).items()
+              if not k.startswith("__") and not callable(v) and not isinstance(v, tuple)}
     p = argparse.ArgumentParser()
-    for name in ("d_model", "num_heads", "num_layers", "d_ff", "batch_size", "max_steps",
-                 "eval_every", "grad_accum", "warmup_steps", "seed", "log_every"):
-        p.add_argument(f"--{name}", type=int, default=None)
-    for name in ("dropout", "learning_rate", "weight_decay", "label_smoothing",
-                 "grad_clip", "ema_decay", "min_lr_ratio", "mask_rate"):
-        p.add_argument(f"--{name}", type=float, default=None)
-    for name in ("data_file", "out_dir", "run_name", "wandb_group", "wandb_project"):
-        p.add_argument(f"--{name}", type=str, default=None)
-    p.add_argument("--no_wandb", dest="use_wandb", action="store_false", default=None)
-    p.add_argument("--no_length_batching", dest="length_batching", action="store_false", default=None)
-    args = p.parse_args()
-    for k, v in vars(args).items():                              # only override what was actually passed
-        if v is not None:
-            setattr(ModelArgs, k, v)
+    for name in fields:
+        p.add_argument(f"--{name}")                             # raw string, coerced below
+    for name, raw in vars(p.parse_args()).items():              # only override what was passed
+        if raw is not None:
+            setattr(ModelArgs, name, _coerce(fields[name], raw))
 
 
 def main():
     parse_args()
+    print(f"[device] {device}")                                  # cuda = GPU, cpu = no GPU allocated
     seed = ModelArgs.seed
     seqs = load_sequences(ModelArgs.data_file, ModelArgs.length_cutoff)
     print("Number of unique sequences:", len(seqs))
@@ -136,6 +137,8 @@ def main():
                group=ModelArgs.wandb_group or f"d{ModelArgs.d_model}_L{ModelArgs.num_layers}",
                name=ModelArgs.run_name or f"seed{seed}",
                config=cfg, mode=None if ModelArgs.use_wandb else "disabled")
+    if wandb.run is not None:
+        wandb.define_metric("val/top1", summary="max")   # sweep optimizes the PEAK top1, not the last eval
 
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     collate_tr = partial(train_collate, vocab=vocab)

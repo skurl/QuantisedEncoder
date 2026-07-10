@@ -1,0 +1,44 @@
+# W&B hyperparameter sweep for the fungal PLM.
+# Launch (from repo root, on a GPU node, inside the container):
+#   sweep_id=$(singularity exec quantised_encoder.sif wandb sweep sweep.yaml 2>&1 | grep -oE 'sweep with ID: \S+' | awk '{print $NF}')
+#   cd bin && ln -sf ../data/fungi_clustered.fasta .          # data path is relative to bin/
+#   srun --gres=gpu:1 singularity exec --nv ../quantised_encoder.sif wandb agent <entity>/quantised-encoder/$sweep_id
+#
+# The agent runs `python train.py` from its CWD, and train.py does `from core import ...`,
+# so the agent MUST be launched from bin/ (where both train.py and core.py live).
+
+program: train.py
+project: quantised-encoder    # else the sweep lands in "uncategorized"
+method: bayes                 # bayes > random once you have a handful of runs; use `random` for pure exploration
+metric:
+  name: val/top1
+  goal: maximize
+
+parameters:
+  # --- fixed for every run in the sweep ---
+  data_file:   {value: fungi_clustered.fasta}   # symlinked into bin/ (see header)
+  out_dir:     {value: ./sweep_out}
+  max_steps:   {value: 2000}                     # short runs = explore more configs; raise once you find a good region
+  eval_every:  {value: 200}
+  use_wandb:   {value: true}                     # REQUIRED: the sweep reads metric/val/top1 from the logged history
+
+  # --- architecture (every d_model here is divisible by both 4 and 8 -> head_dim always even) ---
+  d_model:     {values: [128, 256, 384, 512]}
+  num_heads:   {values: [4, 8]}
+  num_layers:  {values: [4, 6, 8]}
+  d_ff:        {values: [512, 1024, 2048]}
+  dropout:     {values: [0.0, 0.1]}
+
+  # --- optimization ---
+  learning_rate:   {distribution: log_uniform_values, min: 1.0e-4, max: 3.0e-3}
+  weight_decay:    {values: [0.0, 0.01, 0.1]}
+  label_smoothing: {values: [0.0, 0.05, 0.1]}
+  warmup_steps:    {values: [100, 250, 500]}
+  min_lr_ratio:    {values: [0.0, 0.1]}
+  grad_clip:       {values: [0.5, 1.0, 2.0]}
+  batch_size:      {values: [16, 32, 64]}
+
+  # --- masking / EMA ---
+  mask_rate:   {distribution: uniform, min: 0.15, max: 0.30}
+  use_ema:     {values: [true, false]}
+  ema_decay:   {values: [0.99, 0.999, 0.9999]}

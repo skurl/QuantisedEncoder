@@ -37,10 +37,14 @@ process QUANTISE {
 
     output:
     path "quant_results.json"
+    path "wandb", optional: true
 
     script:
     """
-    python ${projectDir}/bin/quantise.py ${ckpt} --data_file ${data} --out_dir .
+    export WANDB_MODE=offline
+    export WANDB_DATA_DIR=\$PWD      # \$HOME is read-only on compute nodes; wandb.Table stages an artifact here
+    python ${projectDir}/bin/quantise.py ${ckpt} --data_file ${data} --out_dir . \
+        --run_name ${id}_quant --wandb_group ${size.tag}
     """
 }
 
