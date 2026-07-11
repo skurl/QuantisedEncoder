@@ -22,7 +22,7 @@ process TRAIN {
     python ${projectDir}/bin/train.py \
         --data_file ${data} --out_dir . \
         --d_model ${size.d} --num_heads ${size.h} --num_layers ${size.l} --d_ff ${size.ff} \
-        --seed ${seed} --max_steps ${params.max_steps} \
+        --seed ${seed} --max_steps ${params.max_steps} --eval_every ${params.eval_every} \
         --run_name ${id} --wandb_group ${size.tag}
     """
 }
