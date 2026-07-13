@@ -1,4 +1,4 @@
-name: secondary-structure-project
+name: quantised-encoder
 
 channels:
   - conda-forge
@@ -8,16 +8,9 @@ channel_priority: strict
 
 dependencies:
   - python=3.10
-  - git
-  - pandas
-  - numpy
-  - scikit-learn
-  - tqdm
-  - docopt
-  - procps-ng
-  - matplotlib
-  - nextflow
-  - biopython
-  - datasets
-  - mmseqs2
-  - wandb
+  - nextflow      # pipeline orchestration
+  - mmseqs2       # PREP: sequence clustering
+  - wandb         # experiment logging
+  - numpy         # core.py metrics (also a torch transitive dep)
+  - procps-ng     # `ps` -- Nextflow needs it for task resource metrics
+  # torch is pip-installed in the Dockerfile (CUDA wheels)

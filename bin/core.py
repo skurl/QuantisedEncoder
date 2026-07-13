@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.parametrize import register_parametrization, remove_parametrizations
 from torch.utils.data import Sampler
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -16,7 +17,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 @dataclass
 class ModelArgs:
     out_dir = "./outputs"
-    data_file = "./data/fungi_clustered.fasta"
+    data_file = "./data/fungi.fasta"    # pipeline overrides via --data_file (PREP dataset per cluster_id)
     length_cutoff = 512
     split_ratios = (0.8, 0.1, 0.1)
     split_seed = 1234
@@ -47,6 +48,8 @@ class ModelArgs:
     wandb_project = "quantised-encoder"
     run_name = None
     wandb_group = None
+    qat_bits = 0              # 0 = normal training; N = quantisation-aware training at N bits
+    init_ckpt = ""           # start from this checkpoint's weights (QAT fine-tune) instead of a fresh init
 
 STANDARD_AA = "ACDEFGHIKLMNPQRSTVWY"
 SPECIALS = ["<pad>", "<mask>", "<cls>", "<unk>", "<eos>"]
@@ -91,7 +94,7 @@ def read_fasta(lines):
 def load_sequences(path, cutoff):
     path = Path(path)
     if not path.exists():
-        raise FileNotFoundError(f"{path} missing - run `python bin/import_fasta.py` first to build it")
+        raise FileNotFoundError(f"{path} missing - run `python bin/downloads.py fungi` first to fetch it")
     with open(path) as fh:
         seqs = [s.upper().replace("*", "") for s in read_fasta(fh)]
     seqs = [s for s in seqs if 0 < len(s) < cutoff]
@@ -278,6 +281,34 @@ def build_arch(vocab):
             "num_classes": vocab.num_classes, "pad_idx": vocab.pad}
 
 
+# QUANTISATION-AWARE TRAINING  (weight-only, per-channel symmetric RTN with straight-through backward)
+
+def fake_quant_weight(w, bits):   # mirror of quantise.fake_quant_weight -- keep in sync
+    qmax = 2 ** (bits - 1) - 1
+    scale = (w.detach().abs().amax(dim=1) / qmax).clamp(min=1e-8)
+    zp = torch.zeros(w.shape[0], dtype=torch.int32, device=w.device)
+    return torch.fake_quantize_per_channel_affine(w, scale, zp, axis=0, quant_min=-qmax, quant_max=qmax)
+
+
+class _FakeQuant(nn.Module):      # parametrization: module.weight returns the fake-quantized weight each forward
+    def __init__(self, bits): super().__init__(); self.bits = bits
+    def forward(self, w): return fake_quant_weight(w, self.bits)
+
+
+def apply_qat(model, bits):       # fake-quant every Linear + the embedding table (the fragile layer)
+    for m in model.modules():
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            register_parametrization(m, "weight", _FakeQuant(bits))
+    return model
+
+
+def bake_qat(model):              # collapse parametrizations so .weight HOLDS the quantized values (save-ready)
+    for m in model.modules():
+        if getattr(m, "parametrizations", None) and "weight" in m.parametrizations:
+            remove_parametrizations(m, "weight", leave_parametrized=True)
+    return model
+
+
 def save_checkpoint(path, model, vocab):
     torch.save({"arch": model.arch, "model": model.state_dict(),
                 "vocab": vocab.aa_vocab, "classes": vocab.classes}, path)
@@ -392,9 +423,37 @@ def _spearman(a, b):
     return float(np.corrcoef(rank(a), rank(b))[0, 1])
 
 
+# BLOSUM62 (standard matrix, hardcoded so we don't pull in biopython for one constant)
+_B62_ORDER = "ARNDCQEGHILKMFPSTWYV"
+_B62 = [
+    [ 4,-1,-2,-2, 0,-1,-1, 0,-2,-1,-1,-1,-1,-2,-1, 1, 0,-3,-2, 0],
+    [-1, 5, 0,-2,-3, 1, 0,-2, 0,-3,-2, 2,-1,-3,-2,-1,-1,-3,-2,-3],
+    [-2, 0, 6, 1,-3, 0, 0, 0, 1,-3,-3, 0,-2,-3,-2, 1, 0,-4,-2,-3],
+    [-2,-2, 1, 6,-3, 0, 2,-1,-1,-3,-4,-1,-3,-3,-1, 0,-1,-4,-3,-3],
+    [ 0,-3,-3,-3, 9,-3,-4,-3,-3,-1,-1,-3,-1,-2,-3,-1,-1,-2,-2,-1],
+    [-1, 1, 0, 0,-3, 5, 2,-2, 0,-3,-2, 1, 0,-3,-1, 0,-1,-2,-1,-2],
+    [-1, 0, 0, 2,-4, 2, 5,-2, 0,-3,-3, 1,-2,-3,-1, 0,-1,-3,-2,-2],
+    [ 0,-2, 0,-1,-3,-2,-2, 6,-2,-4,-4,-2,-3,-3,-2, 0,-2,-2,-3,-3],
+    [-2, 0, 1,-1,-3, 0, 0,-2, 8,-3,-3,-1,-2,-1,-2,-1,-2,-2, 2,-3],
+    [-1,-3,-3,-3,-1,-3,-3,-4,-3, 4, 2,-3, 1, 0,-3,-2,-1,-3,-1, 3],
+    [-1,-2,-3,-4,-1,-2,-3,-4,-3, 2, 4,-2, 2, 0,-3,-2,-1,-2,-1, 1],
+    [-1, 2, 0,-1,-3, 1, 1,-2,-1,-3,-2, 5,-1,-3,-1, 0,-1,-3,-2,-2],
+    [-1,-1,-2,-3,-1, 0,-2,-3,-2, 1, 2,-1, 5, 0,-2,-1,-1,-1,-1, 1],
+    [-2,-3,-3,-3,-2,-3,-3,-3,-1, 0, 0,-3, 0, 6,-4,-2,-2, 1, 3,-1],
+    [-1,-2,-2,-1,-3,-1,-1,-2,-2,-3,-3,-1,-2,-4, 7,-1,-1,-4,-3,-2],
+    [ 1,-1, 1, 0,-1, 0, 0, 0,-1,-2,-2, 0,-1,-2,-1, 4, 1,-3,-2,-2],
+    [ 0,-1, 0,-1,-1,-1,-1,-2,-2,-1,-1,-1,-1,-2,-1, 1, 5,-2,-2, 0],
+    [-3,-3,-4,-4,-2,-2,-3,-2,-2,-3,-2,-3,-1, 1,-4,-3,-2,11, 2,-3],
+    [-2,-2,-2,-3,-2,-1,-2,-3, 2,-1,-1,-2,-1, 3,-3,-2,-2, 2, 7,-1],
+    [ 0,-3,-3,-3,-1,-2,-2,-3,-3, 3, 1,-2, 1,-1,-2,-2, 0,-3,-1, 4],
+]
+BLOSUM62 = {(a, b): _B62[i][j] for i, a in enumerate(_B62_ORDER) for j, b in enumerate(_B62_ORDER)}
+assert all(BLOSUM62[a, b] == BLOSUM62[b, a] for a in _B62_ORDER for b in _B62_ORDER)                    # symmetric
+assert (BLOSUM62["W", "W"], BLOSUM62["C", "C"], BLOSUM62["L", "I"], BLOSUM62["D", "E"], BLOSUM62["F", "Y"]) == (11, 9, 2, 2, 3)
+
+
 @torch.no_grad()
 def blosum_correlation(model, loader, vocab):
-    from Bio.Align import substitution_matrices
     model.eval()
     nc = vocab.num_classes
     conf = torch.zeros(nc, nc, device=device)
@@ -408,8 +467,7 @@ def blosum_correlation(model, loader, vocab):
         counts.index_add_(0, fy[m], torch.ones_like(fy[m], dtype=conf.dtype))
     conf = (conf / counts.clamp(min=1).unsqueeze(1)).cpu().numpy()
     conf = 0.5 * (conf + conf.T)
-    blosum = substitution_matrices.load("BLOSUM62")
     aas = [vocab.out_itos[i] for i in range(nc)]
-    B = np.array([[blosum[a, b] for b in aas] for a in aas], dtype=float)
+    B = np.array([[BLOSUM62[a, b] for b in aas] for a in aas], dtype=float)
     iu = np.triu_indices(nc, k=1)
     return {"spearman_offdiag": _spearman(conf[iu], B[iu]), "aas": aas, "model_matrix": conf.tolist()}

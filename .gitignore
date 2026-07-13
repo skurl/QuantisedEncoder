@@ -223,6 +223,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# holds the W&B API key -- keep out of git
-run.sh

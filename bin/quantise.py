@@ -61,6 +61,13 @@ def check():
     before=lin.weight.detach().clone()
     fake_quantize_(lin,8)
     assert (lin.weight-before).abs().max()<before.abs().max()*0.02
+    net=nn.Sequential(nn.Linear(8,8,bias=False),nn.Linear(8,8,bias=False))   # quantize_layer_ isolates its target
+    w0,w1=net[0].weight.detach().clone(),net[1].weight.detach().clone()
+    quantize_layer_(net,"0",2)
+    assert torch.equal(net[1].weight,w1), "quantize_layer_ leaked into another layer"
+    assert not torch.equal(net[0].weight,w0), "quantize_layer_ did not change its target"
+    X=torch.randn(50,8); Q,_=torch.linalg.qr(torch.randn(8,8))   # CKA must be 1 for a rotated copy
+    assert abs(_cka(X,X)-1)<1e-4 and abs(_cka(X,X@Q)-1)<1e-4, "linear CKA must be rotation-invariant"
 
 def sweep(ckpt):
     model,vocab=load_checkpoint(ckpt,device)
@@ -76,6 +83,80 @@ def sweep(ckpt):
     for bits in BITS:
         rows[f"int{bits}"]=metrics(fake_quantize_(copy.deepcopy(model),bits),loader,vocab,test_seqs,fp_emb)
     return {"checkpoint":ckpt,"params_M":nparams,"results":rows}
+
+def quantize_layer_(model,name,bits):   # quantize ONE named layer's weight in place
+    for n,m in model.named_modules():
+        if n==name:
+            m.weight.data=fake_quant_weight(m.weight.data,bits)
+    return model
+
+def sensitivity(ckpt,bits=2):
+    # quantize each weight layer ALONE to int{bits}, rest fp -> rank layers by damage.
+    # answers: is the int2 cliff a few fragile layers (concentrated) or all at once (diffuse)?
+    model,vocab=load_checkpoint(ckpt,device)
+    seqs=load_sequences(ModelArgs.data_file,ModelArgs.length_cutoff)
+    _,_,te=random_split(len(seqs),ModelArgs.split_ratios,ModelArgs.split_seed)
+    test_seqs=[seqs[i] for i in te[:TEST_SIZE]]
+    loader=DataLoader(precompute(test_seqs,ModelArgs.eval_mask_seed+1,vocab),
+        batch_size=ModelArgs.batch_size,shuffle=False,collate_fn=partial(pad_batch,vocab=vocab))
+    fp_emb=embed(model,test_seqs,vocab)
+    fp=metrics(model,loader,vocab,test_seqs,fp_emb)
+    # every weight layer; flag which the whole-model PTQ sweep touched (Linear only -> embed was left fp!)
+    targets=[(n,isinstance(m,nn.Linear)) for n,m in model.named_modules() if isinstance(m,(nn.Linear,nn.Embedding))]
+    rows=[]
+    for name,in_sweep in targets:
+        r=metrics(quantize_layer_(copy.deepcopy(model),name,bits),loader,vocab,test_seqs,fp_emb)
+        rows.append({"layer":name,"in_ptq_sweep":in_sweep,"top1":r["top1"],"ppl":r["ppl"],
+                     "d_top1":fp["top1"]-r["top1"],"blosum":r["blosum_spearman"],"emb_cos":r["emb_cos_vs_fp"]})
+    rows.sort(key=lambda x:x["d_top1"],reverse=True)   # most damage first
+    print(f"\n=== per-layer int{bits} sensitivity: {ckpt}  (fp top1 {fp['top1']:.2f}) ===")
+    print(f"{'layer':30}{'in_sweep':9}{'dtop1':>8}{'top1':>8}{'ppl':>9}{'emb_cos':>9}")
+    for r in rows:
+        print(f"{r['layer']:30}{str(r['in_ptq_sweep']):9}{r['d_top1']:>8.2f}{r['top1']:>8.2f}{r['ppl']:>9.3f}{r['emb_cos']:>9.3f}")
+    return {"checkpoint":ckpt,"bits":bits,"fp":fp,"layers":rows}
+
+def mixed(ckpt,keep,lo=2,hi=8):
+    # int{lo} everything EXCEPT the `keep` layers (kept at int{hi}) -> how much of the cliff protecting them buys back
+    model,vocab=load_checkpoint(ckpt,device)
+    seqs=load_sequences(ModelArgs.data_file,ModelArgs.length_cutoff)
+    _,_,te=random_split(len(seqs),ModelArgs.split_ratios,ModelArgs.split_seed)
+    test_seqs=[seqs[i] for i in te[:TEST_SIZE]]
+    loader=DataLoader(precompute(test_seqs,ModelArgs.eval_mask_seed+1,vocab),
+        batch_size=ModelArgs.batch_size,shuffle=False,collate_fn=partial(pad_batch,vocab=vocab))
+    fp_emb=embed(model,test_seqs,vocab)
+    def q(keepset):   # quantize a fresh copy: kept layers -> hi bits, everything else -> lo bits
+        m=copy.deepcopy(model)
+        for n,mod in m.named_modules():
+            if isinstance(mod,(nn.Linear,nn.Embedding)):
+                mod.weight.data=fake_quant_weight(mod.weight.data, hi if n in keepset else lo)
+        return m
+    rows={"fp":metrics(model,loader,vocab,test_seqs,fp_emb),
+          f"all_int{lo}":metrics(q(set()),loader,vocab,test_seqs,fp_emb),            # true all-int{lo}, embed included
+          f"keep[{'+'.join(keep)}]@int{hi}":metrics(q(set(keep)),loader,vocab,test_seqs,fp_emb)}
+    cols=["top1","ppl","blosum_spearman","emb_cos_vs_fp"]
+    print(f"\n=== mixed precision (int{lo} except {keep}@int{hi}): {ckpt} ===")
+    print(f"{'config':28}"+"".join(f"{c:>16}" for c in cols))
+    for name,r in rows.items():
+        print(f"{name:28}"+"".join(f"{r[c]:>16.4f}" for c in cols))
+    return {"checkpoint":ckpt,"keep":keep,"lo":lo,"hi":hi,"results":rows}
+
+def _cka(X,Y):   # linear CKA: representation similarity that is INVARIANT to rotation/scale (Kornblith 2019)
+    X=X-X.mean(0,keepdim=True); Y=Y-Y.mean(0,keepdim=True)
+    return ((X.T@Y).norm()**2/((X.T@X).norm()*(Y.T@Y).norm())).item()
+
+def emb_cos_vs(ckpt,ref_ckpt):
+    # compare a checkpoint (e.g. QAT-int2) to a reference fp model on pooled embeddings.
+    # cos = basis-DEPENDENT (drops under rotation); CKA = basis-INVARIANT -> disambiguates rotation vs real loss.
+    model,vocab=load_checkpoint(ckpt,device)
+    ref,_=load_checkpoint(ref_ckpt,device)
+    seqs=load_sequences(ModelArgs.data_file,ModelArgs.length_cutoff)
+    _,_,te=random_split(len(seqs),ModelArgs.split_ratios,ModelArgs.split_seed)
+    test_seqs=[seqs[i] for i in te[:TEST_SIZE]]
+    A,B=embed(model,test_seqs,vocab),embed(ref,test_seqs,vocab)
+    cos=F.cosine_similarity(A,B,dim=1).mean().item()
+    cka=_cka(A,B)
+    print(f"{ckpt} vs {ref_ckpt}:  emb_cos={cos:.4f}  linear_CKA={cka:.4f}")
+    return {"checkpoint":ckpt,"ref":ref_ckpt,"emb_cos_vs_fp":cos,"linear_cka":cka}
 
 def log_wandb(res,run_name,group,use_wandb=True):
     rows=res["results"]
@@ -102,10 +183,34 @@ def main():
     p.add_argument("--run_name")
     p.add_argument("--wandb_group")
     p.add_argument("--no_wandb",dest="use_wandb",action="store_false",default=True)
+    p.add_argument("--sensitivity",action="store_true",help="per-layer int-N sensitivity instead of the bit sweep")
+    p.add_argument("--bits",type=int,default=2,help="low bit-width (sensitivity scan / mixed-precision rest)")
+    p.add_argument("--keep",help="comma-sep layer names to protect at --keep_bits while the rest go to --bits (mixed precision)")
+    p.add_argument("--keep_bits",type=int,default=8,help="bit-width for the protected layers")
+    p.add_argument("--emb_cos_vs",help="reference fp checkpoint: report pooled-embedding cosine vs it (did QAT keep the geometry?)")
     a=p.parse_args()
     if a.data_file: ModelArgs.data_file=a.data_file
     if a.out_dir: ModelArgs.out_dir=a.out_dir
     ckpts=a.checkpoints or default_ckpts()
+    if a.sensitivity:
+        allres=[sensitivity(c,a.bits) for c in ckpts]
+        out=Path(ModelArgs.out_dir)/"sensitivity_results.json"
+        out.write_text(json.dumps(allres,indent=2))
+        print(f"saved -> {out}")
+        return
+    if a.keep is not None:
+        keep=[s for s in a.keep.split(",") if s]
+        allres=[mixed(c,keep,a.bits,a.keep_bits) for c in ckpts]
+        out=Path(ModelArgs.out_dir)/"mixed_results.json"
+        out.write_text(json.dumps(allres,indent=2))
+        print(f"saved -> {out}")
+        return
+    if a.emb_cos_vs is not None:
+        allres=[emb_cos_vs(c,a.emb_cos_vs) for c in ckpts]
+        out=Path(ModelArgs.out_dir)/"emb_cos_results.json"
+        out.write_text(json.dumps(allres,indent=2))
+        print(f"saved -> {out}")
+        return
     allres=[]
     for c in ckpts:
         r=sweep(c)

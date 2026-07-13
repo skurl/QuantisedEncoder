@@ -2,7 +2,6 @@ import argparse, copy, json, math, random, time
 from functools import partial
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,7 +12,8 @@ import wandb
 
 from core import (ModelArgs, device, Vocab, load_sequences, random_split, precompute,
                   pad_batch, train_collate, LengthBatchSampler, Transformer, build_arch,
-                  save_checkpoint, evaluate, unigram_baseline, biochemical_breakdown, blosum_correlation)
+                  save_checkpoint, evaluate, unigram_baseline, biochemical_breakdown, blosum_correlation,
+                  apply_qat, bake_qat)
 
 
 def wlog(data, step=None):   # no-op when there's no active run (disabled mode / not inited)
@@ -140,7 +140,7 @@ def main():
     if wandb.run is not None:
         wandb.define_metric("val/top1", summary="max")   # sweep optimizes the PEAK top1, not the last eval
 
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    random.seed(seed); torch.manual_seed(seed)
     collate_tr = partial(train_collate, vocab=vocab)
     if ModelArgs.length_batching:
         sampler = LengthBatchSampler([len(s) for s in train_seqs], ModelArgs.batch_size, seed)
@@ -151,7 +151,15 @@ def main():
                                   collate_fn=collate_tr, generator=g)
     model = Transformer(build_arch(vocab))
     print(f"[model] {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+    if ModelArgs.init_ckpt:                                       # QAT fine-tune: start from a trained fp checkpoint
+        model.load_state_dict(torch.load(ModelArgs.init_ckpt, map_location=device, weights_only=False)["model"])
+        print(f"[init] loaded weights from {ModelArgs.init_ckpt}")
+    if ModelArgs.qat_bits:                                        # fake-quant Linear+Embedding weights during training
+        apply_qat(model, ModelArgs.qat_bits)
+        print(f"[qat] int{ModelArgs.qat_bits} weight-only, straight-through")
     model = train(model, train_loader, val_loader, vocab, seed)
+    if ModelArgs.qat_bits:                                        # collapse fake-quant -> weights hold the int values
+        bake_qat(model)
     save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", model, vocab)   # always emit the ckpt Nextflow expects
 
     tm = evaluate(model, test_loader, vocab)
