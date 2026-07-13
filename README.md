@@ -34,7 +34,6 @@ Base model (fungal held-out test, ~840k sequences clustered at 50% id):
 ```
 main.nf            Nextflow DAG:  PREP -> TRAIN -> gate -> {EVAL_PGYM, QUANTISE} -> REPORT
 nextflow.config    params (cluster_ids, gate, pgym paths) + SLURM/Singularity resources
-bootstrap.sh       one-time: install Nextflow + download data + prerequisite checks
 Dockerfile         builds the .sif environment (torch + mmseqs + wandb ...)
 environment.yml    conda deps baked into the container
 sweep.yaml         standalone W&B hyperparameter sweep (not part of the DAG)
@@ -58,9 +57,10 @@ cluster is a one-time checklist:
    docker buildx build --platform linux/amd64 -t ghcr.io/skurl/quantised-encoder:0.0.1 --push .
    singularity pull quantised_encoder.sif docker://ghcr.io/skurl/quantised-encoder:0.0.1
    ```
-3. **Bootstrap** (Nextflow launcher + data + checks):
+3. **Fetch Nextflow + data** (on the login node — needs network):
    ```bash
-   bash bootstrap.sh
+   curl -s https://get.nextflow.io | bash     # ./nextflow launcher (needs Java 11+)
+   python bin/downloads.py                     # data/fungi.fasta + data/proteingym/  (~3.4 GB)
    ```
 4. **W&B login** (once): `wandb login` — the pipeline logs live via `~/.netrc`.
 5. **Set your SLURM partitions** in `nextflow.config`: `gpu-compute` for GPU stages, and change the
