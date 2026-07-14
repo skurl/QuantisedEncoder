@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fungalplm"
+version = "0.1.0"
+description = "A small protein language model trained on the fungal kingdom -- embeddings + variant scoring."
+requires-python = ">=3.9"
+authors = [{ name = "Maciej Szczesny" }]
+license = { text = "MIT" }
+dependencies = ["torch", "numpy"]
+
+[project.optional-dependencies]
+hub = ["huggingface_hub"]              # for FungalPLM.load("<user>/fungal-plm") once published
+
+[project.scripts]
+fungalplm = "fungalplm.api:main"       # -> `fungalplm embed proteins.fasta --ckpt m.pth`
+
+[tool.setuptools]
+packages = ["fungalplm"]

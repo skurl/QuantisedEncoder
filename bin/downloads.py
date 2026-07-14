@@ -50,7 +50,7 @@ def proteingym():
     for z in PGYM_ZIPS:
         zp = out / z
         fetch(f"{PGYM_BASE}/{z}", zp)
-        sub = out / zp.stem                # own subfolder, not loose in proteingym/
+        sub = out / zp.stem
         print(f"[unzip] {z} -> {sub.name}/")
         with zipfile.ZipFile(zp) as zf:
             zf.extractall(sub)

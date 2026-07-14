@@ -17,7 +17,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 @dataclass
 class ModelArgs:
     out_dir = "./outputs"
-    data_file = "./data/fungi.fasta"    # pipeline overrides via --data_file (PREP dataset per cluster_id)
+    data_file = "./data/fungi.fasta"    # pipeline overrides via --data_file
     length_cutoff = 512
     split_ratios = (0.8, 0.1, 0.1)
     split_seed = 1234
@@ -25,7 +25,7 @@ class ModelArgs:
     d_model = 512             # sweep ni3jx7oo best config
     num_heads = 8
     num_layers = 6
-    d_ff = 512               # sweep preferred a narrow FFN -> capacity wasn't the limit (data-bound)
+    d_ff = 512               # sweep preferred a narrow FFN
     dropout = 0
     batch_size = 64
     length_batching = True    # group similar-length sequences per batch -> less padding waste
