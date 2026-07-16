@@ -1,7 +1,7 @@
 #!/usr/bin/env nextflow
 // QuantisedEncoder pipeline:  PREP (cluster_id fan-out) -> TRAIN -> gate(top1) -> {EVAL_PGYM, QUANTISE} -> REPORT.
 // The point of the fan-out: test whether keeping homolog depth (looser clustering) lifts ProteinGym.
-// Thin orchestration only -- all logic lives in bin/{downloads,train,quantise,proteingym,report}.py.
+// Thin orchestration only -- all logic lives in bin/{downloads,train,quantise,proteingym,contacts,report}.py.
 nextflow.enable.dsl = 2
 
 
@@ -34,19 +34,22 @@ process TRAIN {
                pattern: "{best_seed*.pth,results_seed*.json,wandb}"   // don't re-publish the fasta we pass through
 
     input:
-    tuple val(id), val(cid), val(size), val(seed), path(data)
+    tuple val(id), val(cid), val(size), val(seed), path(data), path(pgym)
 
     output:
     tuple val(id), val(cid), val(size), val(seed), path("best_seed${seed}.pth"), path("results_seed${seed}.json"), path(data), emit: ckpt
     path "wandb", optional: true
 
     script:
+    def distill = params.distill_teacher ? "--distill_teacher ${params.distill_teacher} --distill_weight ${params.distill_weight}" : ""
+    def panel   = params.dev_match ? "--pgym_panel ${pgym} --pgym_panel_match ${params.dev_match}" : ""   // select on held-out assays
     """
     python ${projectDir}/bin/train.py \
         --data_file ${data} --out_dir . \
         --d_model ${size.d} --num_heads ${size.h} --num_layers ${size.l} --d_ff ${size.ff} \
         --seed ${seed} --max_steps ${params.max_steps} --eval_every ${params.eval_every} \
-        --run_name ${id} --wandb_group ${cid}_${size.tag}
+        --run_name ${id} --wandb_group ${cid}_${size.tag} \
+        ${distill} ${panel}
     """
 }
 
@@ -56,17 +59,18 @@ process EVAL_PGYM {                                   // zero-shot ProteinGym (f
     publishDir path: { "${params.outdir}/${id}" }, mode: 'copy', pattern: "{proteingym_*.csv,row_*.json}"
 
     input:
-    tuple val(id), val(cid), val(size), val(seed), path(ckpt), val(top1), path(pgym)
+    tuple val(id), val(cid), val(size), val(seed), path(ckpt), val(top1), val(blosum), val(blosum_null), path(pgym)
 
     output:
     path "row_${id}.json"
 
     script:
+    def excl = params.dev_match ? "--exclude ${params.dev_match}" : ""   // keep report disjoint from the dev panel
     """
     python ${projectDir}/bin/proteingym.py ${ckpt} \
-        --dms_dir ${pgym} --names fp --baseline ESM2_8M --match ${params.pgym_match} \
+        --dms_dir ${pgym} --names fp --baseline ESM2_8M --match ${params.pgym_match} ${excl} \
         --out proteingym_${id}.csv --summary_json summary.json
-    python -c "import json; s=json.load(open('summary.json')); json.dump({'id':'${id}','cluster_id':'${cid}','tag':'${size.tag}','seed':${seed},'mlm_top1':${top1},'pgym_fp':s.get('fp'),'pgym_esm2':s.get('ESM2_8M')}, open('row_${id}.json','w'), indent=2)"
+    python -c "import json; s=json.load(open('summary.json')); json.dump({'id':'${id}','cluster_id':'${cid}','tag':'${size.tag}','seed':${seed},'mlm_top1':${top1},'blosum':${blosum},'blosum_null':${blosum_null},'pgym_fp':s.get('fp'),'pgym_esm2':s.get('ESM2_8M'),'wt_nll':s.get('fp_wtnll')}, open('row_${id}.json','w'), indent=2)"
     """
 }
 
@@ -86,6 +90,23 @@ process QUANTISE {
     """
     python ${projectDir}/bin/quantise.py ${ckpt} --data_file ${data} --out_dir . \
         --run_name ${id}_quant --wandb_group ${size.tag}
+    """
+}
+
+
+process CONTACT_PROBE {                               // unsupervised attention-contact probe (Rao et al.) -- diagnostic, off by default
+    tag { id }
+    publishDir path: { "${params.outdir}/${id}" }, mode: 'copy', pattern: "contacts_*.json"
+
+    input:
+    tuple val(id), path(ckpt), path(pdb)
+
+    output:
+    path "contacts_${id}.json"
+
+    script:
+    """
+    python ${projectDir}/bin/contacts.py ${ckpt} --pdb_dir ${pdb} --out contacts_${id}.json
     """
 }
 
@@ -116,19 +137,23 @@ workflow {
     experiments = PREP.out
         .combine(Channel.fromList(params.sizes))
         .combine(Channel.fromList(params.seeds))
-        .map { cid, data, size, seed -> tuple("${cid}_${size.tag}_s${seed}", cid, size, seed, data) }
+        .map { cid, data, size, seed -> tuple("${cid}_${size.tag}_s${seed}", cid, size, seed, data, pgym) }   // pgym staged for the in-train selection panel
 
     TRAIN(experiments)
 
-    // gate: attach MLM test top1 from results json, keep only checkpoints above the bar
+    // gate: pull MLM top1 + BLOSUM (model & freq-null) from results json, keep only checkpoints above the bar
     gated = TRAIN.out.ckpt
         .map { id, cid, size, seed, ckpt, res, data ->
-            def top1 = new groovy.json.JsonSlurper().parseText(res.text).test.top1
-            tuple(id, cid, size, seed, ckpt, data, top1)
+            def j = new groovy.json.JsonSlurper().parseText(res.text)
+            tuple(id, cid, size, seed, ckpt, data, j.test.top1, j.blosum.spearman_offdiag, j.blosum_null)
         }
         .filter { it[6] >= params.gate_top1 }
 
-    EVAL_PGYM(gated.map { id, cid, size, seed, ckpt, data, top1 -> tuple(id, cid, size, seed, ckpt, top1, pgym) })
-    QUANTISE(gated.map { id, cid, size, seed, ckpt, data, top1 -> tuple(id, size, seed, ckpt, data) })
+    EVAL_PGYM(gated.map { id, cid, size, seed, ckpt, data, top1, blosum, blosum_null -> tuple(id, cid, size, seed, ckpt, top1, blosum, blosum_null, pgym) })
+    QUANTISE(gated.map { id, cid, size, seed, ckpt, data, top1, blosum, blosum_null -> tuple(id, size, seed, ckpt, data) })
+    if (params.contacts_dir) {                        // optional Tier-2 diagnostic; not a champion selector
+        cpdb = file(params.contacts_dir, checkIfExists: true)
+        CONTACT_PROBE(gated.map { id, cid, size, seed, ckpt, data, top1, blosum, blosum_null -> tuple(id, ckpt, cpdb) })
+    }
     REPORT(EVAL_PGYM.out.collect())
 }

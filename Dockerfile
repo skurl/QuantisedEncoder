@@ -18,6 +18,7 @@ RUN micromamba install -y -p $MAMBA_ROOT_PREFIX -c conda-forge python=3.10 pip &
     $MAMBA_ROOT_PREFIX/bin/python -m pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu124 \
     torch && \
+    $MAMBA_ROOT_PREFIX/bin/python -m pip install --no-cache-dir transformers && \
     micromamba clean --all -y
 
 WORKDIR /app

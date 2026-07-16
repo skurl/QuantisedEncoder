@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fungalplm"
-version = "0.1.0"
+version = "0.0.2"
 description = "A small protein language model trained on the fungal kingdom -- embeddings + variant scoring."
+readme = "PYPI.md"                     # the PyPI project page
 requires-python = ">=3.9"
 authors = [{ name = "Maciej Szczesny" }]
 license = { text = "MIT" }
-dependencies = ["torch", "numpy"]
+keywords = ["protein", "language-model", "bioinformatics", "fungi", "embeddings"]
+dependencies = ["torch", "numpy", "huggingface_hub"]   # hub is core: loading from the Hub is the primary path
 
-[project.optional-dependencies]
-hub = ["huggingface_hub"]              # for FungalPLM.load("<user>/fungal-plm") once published
+[project.urls]
+"Model weights" = "https://huggingface.co/szchesny/fungal-plm"
 
 [project.scripts]
 fungalplm = "fungalplm.api:main"       # -> `fungalplm embed proteins.fasta --ckpt m.pth`

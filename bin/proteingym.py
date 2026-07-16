@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from core import device, load_checkpoint, Vocab, Transformer, build_arch, _spearman
+from core import device, load_checkpoint, Vocab, Transformer, build_arch, _spearman, blosum_correlation_unigram
 
 
 def parse_mutation(m):                        # "A25G" -> (wt='A', pos0=24, mut='G')
@@ -52,6 +52,13 @@ def wt_position_logprobs(model, vocab, wt, chunk=64):
     return out
 
 
+def wt_nll(cache, vocab, wt):
+    """Mean masked-marginal NLL of the wild-type residues -- the Hou et al. bell-curve x-axis.
+    Peak fitness signal sits at NLL ~1.2; a small/undertrained model reads high (underfit limb)."""
+    lp = [cache[p][vocab.out_stoi[a]].item() for p, a in enumerate(wt) if a in vocab.out_stoi]
+    return -sum(lp) / len(lp) if lp else float("nan")
+
+
 def score_all(cache, vocab, wt, mutants):
     scores = []
     for m in mutants:
@@ -62,6 +69,37 @@ def score_all(cache, vocab, wt, mutants):
             s += (cache[p][vocab.out_stoi[b]] - cache[p][vocab.out_stoi[a]]).item()
         scores.append(s)
     return scores
+
+
+def load_panel(dms_dir, match=None, max_len=1024):
+    """Parse a few DMS csvs ONCE -> [(assay, wt, mutants, dms)], reused every eval during training.
+    ponytail: keep this panel DISJOINT from the assays REPORT scores on, else you select on your test set."""
+    files = sorted(Path(dms_dir).glob("*.csv"))
+    if match:
+        pats = [s.lower() for s in match.split(",")]
+        files = [f for f in files if any(s in f.stem.lower() for s in pats)]
+    panel = []
+    for f in files:
+        rows = list(csv.DictReader(open(f)))
+        if not rows or "mutated_sequence" not in rows[0]:
+            continue
+        wt = wt_from_row(rows[0]["mutated_sequence"], rows[0]["mutant"])
+        if len(wt) > max_len:
+            continue
+        panel.append((f.stem, wt, [r["mutant"] for r in rows], [float(r["DMS_score"]) for r in rows]))
+    return panel
+
+
+@torch.no_grad()
+def score_panel(model, vocab, panel):
+    """Mean per-assay Spearman of the current model over a preloaded panel (the north-star proxy)."""
+    sp = []
+    for _, wt, mutants, dms in panel:
+        pred = score_all(wt_position_logprobs(model, vocab, wt), vocab, wt, mutants)
+        keep = [(p, d) for p, d in zip(pred, dms) if p == p]        # drop NaN variants
+        if len(keep) > 2:
+            sp.append(_spearman(*zip(*keep)))
+    return sum(sp) / len(sp) if sp else float("nan")
 
 
 def run_assay(models, vocab, csv_path, max_len, baselines=()):
@@ -75,9 +113,11 @@ def run_assay(models, vocab, csv_path, max_len, baselines=()):
         return {"assay": Path(csv_path).stem, "n": len(mutants), "L": len(wt), "skipped": "too_long"}
     res = {"assay": Path(csv_path).stem, "n": len(mutants), "L": len(wt)}
     for name, model in models.items():
-        pred = score_all(wt_position_logprobs(model, vocab, wt), vocab, wt, mutants)
+        cache = wt_position_logprobs(model, vocab, wt)               # reused for fitness AND wt-NLL
+        pred = score_all(cache, vocab, wt, mutants)
         keep = [(p, d) for p, d in zip(pred, dms) if p == p]          # drop NaN variants
         res[name] = _spearman(*zip(*keep)) if len(keep) > 2 else float("nan")
+        res[name + "_wtnll"] = wt_nll(cache, vocab, wt)
     for col in baselines:                                             # precomputed score columns (e.g. ESM2_8M)
         if col not in rows[0]:
             continue
@@ -97,7 +137,13 @@ def demo():                                   # invariants: identity mutation sc
     cache = wt_position_logprobs(model, vocab, seqs[0])
     assert abs(score_all(cache, vocab, seqs[0], ["A1A"])[0]) < 1e-6, "identity mutation must score 0"
     assert wt_from_row("GCDEFGHIKLMNPQRSTVWY", "A1G") == seqs[0], "WT reconstruction failed"
-    print("demo OK (identity=0, WT reconstructs)")
+    panel = [("t", seqs[0], ["A1G", "C2A", "D3E"], [1.0, 2.0, 3.0])]   # exercise the in-training panel path
+    sp = score_panel(model, vocab, panel)
+    assert isinstance(sp, float), "score_panel must return a float"
+    nll = wt_nll(cache, vocab, seqs[0])                                # bell-curve x-axis
+    assert nll >= 0, f"wt-NLL is a mean negative-log-prob, must be >= 0, got {nll}"
+    assert isinstance(blosum_correlation_unigram(["AAAACDEFG", "ACDEFGHIK", "LMNPQRSTV"], vocab), float)
+    print(f"demo OK (identity=0, WT reconstructs, panel spearman {sp:.3f}, wt-NLL {nll:.3f})")
 
 
 def main():
@@ -106,6 +152,7 @@ def main():
     p.add_argument("--dms"); p.add_argument("--dms_dir")
     p.add_argument("--names"); p.add_argument("--max_len", type=int, default=1024)
     p.add_argument("--match", help="comma-sep substrings; keep only assays whose filename contains one (e.g. YEAST,RHOTO,LIPST)")
+    p.add_argument("--exclude", help="comma-sep substrings; DROP assays whose filename contains one (e.g. the held-out dev panel)")
     p.add_argument("--baseline", help="comma-sep precomputed score columns to also Spearman (e.g. ESM2_8M) -- needs the zero-shot-scores CSVs")
     p.add_argument("--out", default="proteingym_results.csv")
     p.add_argument("--summary_json", help="write {model: mean_spearman} here (for the Nextflow REPORT stage)")
@@ -124,6 +171,9 @@ def main():
     if a.match:                                                     # e.g. --match YEAST,RHOTO,LIPST for the fungal subset
         pats = [s.lower() for s in a.match.split(",")]
         files = [f for f in files if any(s in f.stem.lower() for s in pats)]
+    if a.exclude:                                                   # drop the dev-panel assays so report stays disjoint
+        ex = [s.lower() for s in a.exclude.split(",")]
+        files = [f for f in files if not any(s in f.stem.lower() for s in ex)]
     baselines = a.baseline.split(",") if a.baseline else []
     rows = []
     for f in files:
@@ -138,6 +188,11 @@ def main():
         means[name] = sum(vals) / len(vals) if vals else None
         if vals:
             print(f"  mean Spearman [{name}] = {means[name]:.4f}  (n={len(vals)})")
+    for name in models:                                              # + mean wt-NLL -> bell-curve x-coordinate
+        vals = [r[name + "_wtnll"] for r in scored if name + "_wtnll" in r and r[name + "_wtnll"] == r[name + "_wtnll"]]
+        if vals:
+            means[name + "_wtnll"] = sum(vals) / len(vals)
+            print(f"  mean wt-NLL  [{name}] = {means[name + '_wtnll']:.3f}  (bell curve: peak ~1.2)")
     if a.summary_json:
         Path(a.summary_json).write_text(json.dumps(means, indent=2))
     if scored:

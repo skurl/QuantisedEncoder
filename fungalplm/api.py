@@ -8,6 +8,7 @@
     fungalplm embed proteins.fasta --ckpt m.pth -o emb.npz [--per-residue]
 """
 import argparse
+import os
 
 import numpy as np
 import torch
@@ -35,9 +36,18 @@ class FungalPLM:
         self.model, self.vocab, self.device = model, vocab, device
 
     @classmethod
-    def load(cls, ckpt, device=None):
+    def load(cls, ckpt, device=None, filename="fungal-plm.pth"):
+        """A local .pth path, or a HuggingFace repo id like "user/fungal-plm"."""
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        model, vocab = load_checkpoint(ckpt, device)
+        ckpt = str(ckpt)
+        if os.path.exists(ckpt):
+            path = ckpt
+        elif ckpt.count("/") == 1 and not ckpt.endswith((".pth", ".pt")) and not ckpt.startswith((".", "/", "~")):
+            from huggingface_hub import hf_hub_download     # "owner/name" -> pull `filename` from the Hub
+            path = hf_hub_download(ckpt, filename)
+        else:                                              # looks like a path but isn't there -> say so; don't post a typo to the Hub
+            raise FileNotFoundError(f"{ckpt!r}: not a local checkpoint, and not an 'owner/name' HuggingFace repo id")
+        model, vocab = load_checkpoint(path, device)
         model.eval()
         return cls(model, vocab, device)
 
@@ -74,6 +84,11 @@ def demo():                                 # shape check: per-residue length mu
     pooled, per = plm.embed(seqs), plm.embed(seqs, per_residue=True)
     assert pooled.dim() == 2 and pooled.shape[0] == 2, pooled.shape
     assert [p.shape[0] for p in per] == [9, 3], [p.shape[0] for p in per]
+    try:                                    # a typo'd local path must fail clearly, not get mis-sent to the Hub
+        FungalPLM.load("nonexistent_typo.pth")
+        assert False, "missing checkpoint should raise FileNotFoundError"
+    except FileNotFoundError:
+        pass
     print(f"demo OK: pooled {tuple(pooled.shape)}, per-residue {[p.shape[0] for p in per]}")
 
 

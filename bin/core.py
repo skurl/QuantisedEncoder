@@ -50,6 +50,10 @@ class ModelArgs:
     wandb_group = None
     qat_bits = 0              # 0 = normal training; N = quantisation-aware training at N bits
     init_ckpt = ""           # start from this checkpoint's weights (QAT fine-tune) instead of a fresh init
+    distill_teacher = ""     # HF model id (e.g. facebook/esm2_t12_35M_UR50D); "" = no distillation. Any id works -- swap teachers by config.
+    distill_weight = 1.0     # weight on the representation-matching loss added to the MLM loss
+    pgym_panel = ""          # dir of a FEW held-out DMS csvs; if set, select checkpoints on their mean Spearman (north star) instead of val BLOSUM
+    pgym_panel_match = ""    # optional comma-sep filename filter for the panel (keep it DISJOINT from the assays REPORT scores on)
 
 STANDARD_AA = "ACDEFGHIKLMNPQRSTVWY"
 SPECIALS = ["<pad>", "<mask>", "<cls>", "<unk>", "<eos>"]
@@ -144,7 +148,8 @@ def pad_batch(items, vocab):
 
 
 def train_collate(batch, vocab):
-    return pad_batch([mask_sequence(s, random, vocab) for s in batch], vocab)
+    x, y, attn = pad_batch([mask_sequence(s, random, vocab) for s in batch], vocab)
+    return x, y, attn, batch          # keep raw seqs for the (optional) distillation teacher
 
 
 def precompute(seqs, seed, vocab):
@@ -212,15 +217,23 @@ class MultiHeadAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model, bias=False)
         self.rope = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x, padding_mask=None):
+    def forward(self, x, padding_mask=None, return_attn=False):
         B, L, D = x.shape
         split = lambda t: t.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         q, k, v = split(self.W_q(x)), split(self.W_k(x)), split(self.W_v(x))
         cos, sin = self.rope(L)
         q, k = apply_rope(q, k, cos, sin)
         attn_mask = padding_mask[:, None, None, :] if padding_mask is not None else None
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
-                                             dropout_p=self.dropout if self.training else 0.0)
+        if return_attn:                          # un-fused path: recompute softmax(QK^T) to EXPOSE the map (probing only)
+            scores = q @ k.transpose(-2, -1) * self.head_dim ** -0.5
+            if attn_mask is not None:
+                scores = scores.masked_fill(~attn_mask, float("-inf"))
+            attn = scores.softmax(-1)
+            self._attn = attn.detach()           # [B, H, L, L] stashed for the contact probe; identical to what SDPA computes
+            out = attn @ v
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                                 dropout_p=self.dropout if self.training else 0.0)
         return self.W_o(out.transpose(1, 2).contiguous().view(B, L, D))
 
 
@@ -234,8 +247,8 @@ class EncoderLayer(nn.Module):
                                 nn.Linear(d_ff, d_model), nn.Dropout(dropout))
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, padding_mask=None):
-        x = x + self.dropout(self.attn(self.norm1(x), padding_mask))
+    def forward(self, x, padding_mask=None, return_attn=False):
+        x = x + self.dropout(self.attn(self.norm1(x), padding_mask, return_attn))
         x = x + self.dropout(self.ff(self.norm2(x)))
         return x
 
@@ -267,12 +280,16 @@ class Transformer(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, src, attention_mask=None, return_repr=False):
+    def forward(self, src, attention_mask=None, return_repr=False, return_attn=False):
         x = self.dropout(self.embed(src))
+        maps = []
         for layer in self.layers:
-            x = layer(x, attention_mask)
+            x = layer(x, attention_mask, return_attn=return_attn)
+            if return_attn:
+                maps.append(layer.attn._attn)          # [B, H, L, L] per layer, for the contact probe
         x = self.final_norm(x)
-        return x if return_repr else self.fc(x)
+        out = x if return_repr else self.fc(x)
+        return (out, maps) if return_attn else out
 
 
 def build_arch(vocab):
@@ -307,6 +324,38 @@ def bake_qat(model):              # collapse parametrizations so .weight HOLDS t
         if getattr(m, "parametrizations", None) and "weight" in m.parametrizations:
             remove_parametrizations(m, "weight", leave_parametrized=True)
     return model
+
+
+# DISTILLATION  (representation transfer from a frozen HF teacher -- training-only, needs `transformers`)
+# ponytail: match per-residue hidden states, not logits -> teacher-vocab-agnostic. Any HF encoder that
+# tokenises 1-token-per-residue with a leading <cls> (ESM2, ESM-C, ...) aligns index-for-index with ours.
+
+def load_teacher(name):
+    from transformers import AutoModel, AutoTokenizer          # heavy import, only when distilling
+    tok = AutoTokenizer.from_pretrained(name)
+    teacher = AutoModel.from_pretrained(name).to(device).eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher, tok, teacher.config.hidden_size
+
+
+@torch.no_grad()
+def teacher_reps(teacher, tok, seqs):                          # [B, L, D] last hidden states; residue i at index i
+    enc = tok(list(seqs), return_tensors="pt", padding=True)
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
+        return teacher(**enc).last_hidden_state                # bf16 teacher forward ~2x faster; distill_loss casts to float anyway
+
+
+
+def distill_loss(student_rep, proj, t_rep, valid):
+    """1 - cosine between projected student reps and teacher reps, over valid (unmasked, non-special) residues.
+    Student and teacher put residue i at the same index i, so we compare position-for-position."""
+    L = min(student_rep.size(1), t_rep.size(1))
+    m = valid[:, :L]
+    s = proj(student_rep[:, :L][m])                            # [N, D_teacher]
+    t = t_rep[:, :L][m]
+    return (1 - F.cosine_similarity(s, t.float(), dim=-1)).mean()
 
 
 def save_checkpoint(path, model, vocab):
@@ -450,6 +499,23 @@ _B62 = [
 BLOSUM62 = {(a, b): _B62[i][j] for i, a in enumerate(_B62_ORDER) for j, b in enumerate(_B62_ORDER)}
 assert all(BLOSUM62[a, b] == BLOSUM62[b, a] for a in _B62_ORDER for b in _B62_ORDER)                    # symmetric
 assert (BLOSUM62["W", "W"], BLOSUM62["C", "C"], BLOSUM62["L", "I"], BLOSUM62["D", "E"], BLOSUM62["F", "Y"]) == (11, 9, 2, 2, 3)
+
+
+def blosum_correlation_unigram(train_seqs, vocab):
+    """Frequency-only NULL for blosum_correlation: a context-free model that always predicts the
+    marginal AA frequency (conf[a][b] = f[b]). Its off-diagonal-vs-BLOSUM rho is the floor that
+    substitution structure gives you for free -- the trained model's rho only means "learned
+    biology, not just frequencies" insofar as it clears this. (Hou et al. 2026: a site-independent
+    frequency model is a strong ProteinGym baseline, so this number must exist next to the headline.)"""
+    counts = Counter(aa for s in train_seqs for aa in s if aa in vocab.out_stoi)
+    n = max(1, sum(counts.values()))
+    f = np.array([counts[vocab.out_itos[i]] / n for i in range(vocab.num_classes)])
+    tiled = np.tile(f, (vocab.num_classes, 1))
+    conf = 0.5 * (tiled + tiled.T)                              # symmetrised, exactly as blosum_correlation does
+    aas = [vocab.out_itos[i] for i in range(vocab.num_classes)]
+    B = np.array([[BLOSUM62[a, b] for b in aas] for a in aas], dtype=float)
+    iu = np.triu_indices(vocab.num_classes, k=1)
+    return _spearman(conf[iu], B[iu])
 
 
 @torch.no_grad()

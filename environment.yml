@@ -13,4 +13,4 @@ dependencies:
   - wandb         # experiment logging
   - numpy         # core.py metrics (also a torch transitive dep)
   - procps-ng     # `ps` -- Nextflow needs it for task resource metrics
-  # torch is pip-installed in the Dockerfile (CUDA wheels)
+  # torch + transformers (distillation teacher) are pip-installed in the Dockerfile
