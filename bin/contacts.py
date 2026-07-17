@@ -115,6 +115,13 @@ def precision_at_L(scores, contacts, valid, sep, topk=None):
     return float(contacts[ii[order], jj[order]].mean())
 
 
+def base_rate(contacts, valid, sep):        # a random scorer's expected P@L = fraction of eligible pairs that ARE contacts
+    L = contacts.shape[0]
+    ii, jj = np.triu_indices(L, k=sep)
+    keep = valid[ii] & valid[jj]
+    return float(contacts[ii[keep], jj[keep]].mean()) if keep.any() else float("nan")
+
+
 def build(model, vocab, pdb_dir, min_plddt=70.0, max_len=1024):
     """Load every structure -> per-protein (features, contacts, valid mask). Skips length mismatches."""
     data = {}
@@ -154,18 +161,21 @@ def evaluate(model, vocab, pdb_dir, min_plddt=70.0, max_len=1024):
     per_layer = [fit_probe(Xtr[:, l * H:(l + 1) * H], ytr) for l in range(n_layers)]   # H features each
 
     res = {"n_train": len(tr), "n_test": len(te), "n_layers": n_layers, "p_at_L": [], "p_at_L_LR": [],
-           "per_layer_p_at_L": [[] for _ in range(n_layers)]}
+           "random_L": [], "random_LR": [], "per_layer_p_at_L": [[] for _ in range(n_layers)]}
     for n in te:
         feats, contacts, valid = data[n]
         s = probe_scores(full, feats)
         res["p_at_L"].append(precision_at_L(s, contacts, valid, 6))
         res["p_at_L_LR"].append(precision_at_L(s, contacts, valid, 24))
+        res["random_L"].append(base_rate(contacts, valid, 6))
+        res["random_LR"].append(base_rate(contacts, valid, 24))
         for l in range(n_layers):
             sl = probe_scores(per_layer[l], feats[:, :, l * H:(l + 1) * H])
             res["per_layer_p_at_L"][l].append(precision_at_L(sl, contacts, valid, 6))
 
     mean = lambda xs: float(np.nanmean(xs)) if xs else float("nan")
     return {"p_at_L": mean(res["p_at_L"]), "p_at_L_LR": mean(res["p_at_L_LR"]),
+            "p_at_L_random": mean(res["random_L"]), "p_at_L_LR_random": mean(res["random_LR"]),
             "per_layer_p_at_L": [mean(v) for v in res["per_layer_p_at_L"]],
             "n_train": res["n_train"], "n_test": res["n_test"]}
 
@@ -216,7 +226,8 @@ def main():
     model, vocab = load_checkpoint(a.ckpt, device); model.eval()
     res = evaluate(model, vocab, a.pdb_dir, a.min_plddt, a.max_len)
     Path(a.out).write_text(json.dumps(res, indent=2))
-    print(f"P@L-LR {res['p_at_L_LR']:.3f}  |  P@L {res['p_at_L']:.3f}  "
+    print(f"P@L-LR {res['p_at_L_LR']:.3f} (random {res['p_at_L_LR_random']:.3f})  |  "
+          f"P@L {res['p_at_L']:.3f} (random {res['p_at_L_random']:.3f})  "
           f"(train {res['n_train']} / test {res['n_test']})")
     print("per-layer P@L:", " ".join(f"{v:.3f}" for v in res["per_layer_p_at_L"]))
     print(f"saved -> {a.out}")
