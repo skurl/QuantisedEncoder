@@ -53,7 +53,7 @@ CKA, so the drift is a basis rotation, not lost information.
 Distillation from ESM2 lifts token metrics (top-1, perplexity) but adds no fitness
 and erodes the ubiquitin edge, decided not to pursue it further in this project; the contact probe did rise 2-3x above the random noise levels, but nowhere near close to actually usuable models (below 0.10), so I decided not to use it further in this project.
 
-An analogous run on all [eukaryotic sequences](https://github.com/skurl/EukaryoticEncoder) is in progress and shows the same pattern so far.
+An analogous run on all [eukaryotic sequences](https://github.com/skurl/EukaryoticEncoder), and demonstrated the same results: this model seems to be really good (2x better than ESM2-8M) at Mavor 2016 and Roscore 2013 benchmarks for ubiquitin mutations.
 
 ## Author
 
