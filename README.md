@@ -1,15 +1,13 @@
 # QuantisedEncoder
 
 A small (~9.5M parameter) masked-language-model protein encoder trained only on fungal proteins
-(UniProt taxon 4751). It was built for two reasons: to study how low-bit **quantisation** degrades a
-protein language model, and to be a usable, lightweight encoder for fungal proteins. It runs as a
-**Nextflow pipeline** on SLURM + Singularity and logs to Weights & Biases.
+(UniProt taxon 4751). I built it to study the effects of quantisation, and which features get preserved, and to be a usable, lightweight encoder for fungal proteins.
 
 The model is ESM/BERT-style: RoPE, pre-norm, SDPA attention, 6 layers, d_model 512, predicting the 20
 standard amino acids at masked positions.
 
 The trained weights are on the Hugging Face Hub (`szchesny/fungal-plm`), and the inference wrapper is
-on PyPI — `pip install fungalplm`.
+on PyPI — `pip install fungalplm`. The model was trained and evaluated with Nextflow, using Weights & Biases for hyperparameter optimisation.
 
 ## Repository layout
 
@@ -27,37 +25,36 @@ bin/
   report.py        rank checkpoints -> champion.json + leaderboard.csv
 ```
 
-The `fungalplm/` package is the inference side: a two-line API to load a checkpoint (a local file, or
-`szchesny/fungal-plm` from the Hub) and get per-protein or per-residue embeddings. Install it with
-`pip install fungalplm`.
+Install the package using `pip install fungalplm`.
 
 ## Results
 
-The quantisation picture is clear: most of the bit-width range is essentially free, one layer (the
-embedding table) is a cliff, and training for the low-bit regime (QAT) recovers most of what plain
-post-training quantisation loses at int2. That could be because this model is still very much overparameterised.
+The model was evaluated on three axes: BLOSUM62 substitution correlation, ProteinGym zero-shot
+variant-effect scoring (14 yeast assays vs an ESM2-8M baseline), and an unsupervised attention contact
+probe.
 
-As for the models efficiency and accuracy, this model is worse than ESM2-8M, which is  the same size, but broadly trained, on broader tasks, with about
-0.05 vs 0.19 mean Spearman across 14 fungal ProteinGym assays. But on proteins where its likelihood is
-well-calibrated — ubiquitin, which sits near the fitness-optimal NLL band — it **beats** ESM2, and
-that win holds across random seeds.
+BLOSUM proved to not directly translate to fitness. The model reaches **0.36** BLOSUM Spearman against a
+**0.13** frequency-null, yet a higher BLOSUM score
+doesn't track fitness. The much better benchmark is ProteinGym, and fitness there is gated by wild-type NLL: the
+model predicts a protein's mutational effects well only where its own likelihood sits near the **~1.2
+NLL** band.
 
-Distillation from ESM2 was tested and turned off. It improves the token-level metrics (top-1, perplexity)
-but not fitness, and it actually *erodes* the ubiquitin advantage — matching a teacher that is only
-mediocre on ubiquitin drags the student down to that level. Breadth, not representation-matching, is
-the real lever for fitness, and that means a larger model than this one.
+On aggregate it trails ESM2-8M — **0.08 vs 0.19** mean Spearman — as expected for the same ~9.5M
+parameters trained on fungi alone rather than broadly. But on **ubiquitin**, the one protein it
+calibrates well (WT-NLL ~1.4), it beats ESM2 on most assays, and the win holds across seeds.
 
-## Future plans
+**Quantisation is where the small model pays off.** int8 and int4 are essentially free (top-1 within 0.1
+pt, embedding cosine ≥ 0.997); int3 is a soft edge (top-1 −1 pt, BLOSUM −18%); int2 is a cliff — full
+int2 drops top-1 to **6.8%** (≈ a unigram baseline), with the damage localised to the embedding layer.
+Quantisation-aware training reclaims it: weight-only int2 QAT recovers top-1 to **~22.5%** (fp is 23.9%)
+— int2 at roughly int3 quality. The QAT embeddings sit at 0.78 cosine to the fp model but 0.92 linear
+CKA, so the drift is a basis rotation, not lost information.
 
-- **Quantisation** — turn the low-bit study into a deployable artifact: a QAT-int2 checkpoint that runs
-  on CPU with no GPU, and a comparison of native ternary training against post-training int2.
-- **Sparse autoencoders (SAEs)** — train SAEs on the model's activations to interpret the features it
-  learns, and ask which of those features survive quantisation.
-- **Contact maps** — run the attention-contact probe end to end (P@L / P@L-LR) and look at how
-  structural information is distributed across layers.
-- **Others** — broad pre-training / fine-tuning to close the fitness gap; exposing the wild-type-NLL
-  confidence gate directly in the `fungalplm` API; per-position saturation-mutagenesis effect maps;
-  and checking whether the ubiquitin result generalises to other conserved proteins.
+Two negative results: distillation from ESM2 lifts token metrics (top-1, perplexity) but adds no fitness
+and erodes the ubiquitin edge, so it's off by default; and the contact probe shows only a faint structure
+signal (~2–3× a random baseline), far below usable.
+
+An analogous run on all [eukaryotic sequences](https://github.com/skurl/EukaryoticEncoder) is in progress and shows the same pattern so far.
 
 ## Author
 

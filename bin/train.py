@@ -41,7 +41,7 @@ def train(model, train_loader, val_loader, vocab, seed, teacher=None, tok=None, 
     ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ModelArgs.ema_decay)) if ModelArgs.use_ema else None
     specials = torch.tensor([vocab.cls, vocab.eos, vocab.pad, vocab.mask, vocab.unk], device=device)
 
-    best_score, best_state = float("-inf"), None            # select on val BLOSUM (higher = better), not token nll
+    best_score, best_state = float("-inf"), None            # higher = better (ModelArgs.select_metric; ppl is negated)
     global_step, micro, tic, tok_acc = 0, 0, time.time(), torch.zeros((), device=device)
     opt.zero_grad()
 
@@ -81,23 +81,24 @@ def train(model, train_loader, val_loader, vocab, seed, teacher=None, tok=None, 
             if global_step % ModelArgs.eval_every == 0:
                 em = ema.module if ema else model
                 val = evaluate(em, val_loader, vocab)
-                blosum = blosum_correlation(em, val_loader, vocab)["spearman_offdiag"]   # leakage-resistant floor metric
-                logs = {"val/blosum": blosum, "val/ppl": val["perplexity"], "val/top1": val["top1"],
-                        "val/top3": val["top3"], "val/top5": val["top5"], "val/nll": val["nll"]}
-                score = blosum                                   # default selector
-                if panel:                                        # north star: select on held-out ProteinGym instead
-                    score = score_panel(em, vocab, panel)
-                    logs["val/pgym_panel"] = score
+                logs = {"val/ppl": val["perplexity"], "val/top1": val["top1"], "val/top3": val["top3"],
+                        "val/top5": val["top5"], "val/nll": val["nll"]}
+                metric = ModelArgs.select_metric
+                if metric == "pgym" and panel:                   # held-out ProteinGym (only sensible with a domain-matched panel)
+                    score = score_panel(em, vocab, panel); logs["val/pgym_panel"] = score
+                elif metric == "blosum":                         # leakage-resistant biochemistry (extra val pass)
+                    score = blosum_correlation(em, val_loader, vocab)["spearman_offdiag"]; logs["val/blosum"] = score
+                else:                                            # "ppl" (default): lowest perplexity -> negate so higher = better
+                    score = -val["perplexity"]
                 improved = score > best_score + 1e-4
                 if improved:
                     best_score = score
                     best_state = copy.deepcopy(em.state_dict())
                     save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", em, vocab)
                 wlog(logs, global_step)
-                sel = f"pgym {score:.3f}" if panel else f"blosum {blosum:.3f}"
-                print(f"  [eval {global_step}] {sel} | ppl {val['perplexity']:.3f} | "
-                      f"top1 {val['top1']:.2f}% {'*' if improved else ''}")
-                model.train()                                    # back to train mode after eval (+ blosum/panel ran extra passes)
+                print(f"  [eval {global_step}] ppl {val['perplexity']:.3f} | top1 {val['top1']:.2f}% "
+                      f"| best-on-{metric} {'*' if improved else ''}")
+                model.train()                                    # back to train mode after eval
 
             if global_step >= ModelArgs.max_steps:
                 break
@@ -136,6 +137,9 @@ def main():
 
     tr, va, te = random_split(len(seqs), ModelArgs.split_ratios, ModelArgs.split_seed)
     train_seqs, val_seqs, test_seqs = ([seqs[i] for i in g] for g in (tr, va, te))
+    if ModelArgs.eval_max_seqs:                              # cap eval sets: 10% of a huge corpus makes every eval crawl
+        val_seqs, test_seqs = val_seqs[:ModelArgs.eval_max_seqs], test_seqs[:ModelArgs.eval_max_seqs]
+        print(f"[eval] capped val/test to {ModelArgs.eval_max_seqs} sequences each")
     collate = partial(pad_batch, vocab=vocab)
     val_loader = DataLoader(precompute(val_seqs, ModelArgs.eval_mask_seed, vocab),
                             batch_size=ModelArgs.batch_size, shuffle=False, collate_fn=collate)
@@ -152,9 +156,10 @@ def main():
                name=ModelArgs.run_name or f"seed{seed}",
                config=cfg, mode=None if ModelArgs.use_wandb else "disabled")
     if wandb.run is not None:
-        wandb.define_metric("val/pgym_panel", summary="max")   # north-star selector (when a panel is set)
-        wandb.define_metric("val/blosum", summary="max")       # floor metric / selector fallback
-        wandb.define_metric("val/top1", summary="max")         # kept for monitoring, no longer the selector
+        wandb.define_metric("val/ppl", summary="min")          # default selector: track the lowest perplexity
+        wandb.define_metric("val/pgym_panel", summary="max")   # alternate selector (select_metric="pgym")
+        wandb.define_metric("val/blosum", summary="max")       # alternate selector (select_metric="blosum")
+        wandb.define_metric("val/top1", summary="max")         # monitoring only
 
     random.seed(seed); torch.manual_seed(seed)
     collate_tr = partial(train_collate, vocab=vocab)
@@ -178,8 +183,9 @@ def main():
         teacher, tok, t_dim = load_teacher(ModelArgs.distill_teacher)
         proj = nn.Linear(ModelArgs.d_model, t_dim).to(device)     # student d -> teacher d, distill-only, not saved
         print(f"[distill] teacher {ModelArgs.distill_teacher} (d={t_dim}), weight {ModelArgs.distill_weight}")
-    panel = load_panel(ModelArgs.pgym_panel, ModelArgs.pgym_panel_match) if ModelArgs.pgym_panel else []
-    if panel:                                                     # select checkpoints on these held-out assays
+    panel = (load_panel(ModelArgs.pgym_panel, ModelArgs.pgym_panel_match)
+             if ModelArgs.pgym_panel and ModelArgs.select_metric == "pgym" else [])   # skip the (fungal) panel unless selecting on it
+    if panel:
         print(f"[pgym panel] selecting on {len(panel)} assays: {[a for a, *_ in panel]}")
     model = train(model, train_loader, val_loader, vocab, seed, teacher, tok, proj, panel)
     if ModelArgs.qat_bits:                                        # collapse fake-quant -> weights hold the int values

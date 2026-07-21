@@ -44,6 +44,8 @@ class ModelArgs:
     log_every = 100
     seed = 42
     eval_mask_seed = 999
+    eval_max_seqs = 5000      # cap val/test used for eval -> eval cost is fixed, not proportional to dataset size (0 = use all)
+    select_metric = "ppl"     # checkpoint selection: "ppl" (lowest val perplexity), "blosum", or "pgym" (needs a matched panel)
     use_wandb = True
     wandb_project = "quantised-encoder"
     run_name = None

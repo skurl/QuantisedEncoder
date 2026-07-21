@@ -1,23 +1,41 @@
 """Fetch every input the pipeline needs. Run once on the login node (has network):
 
-    python bin/downloads.py              # everything
+    python bin/downloads.py              # everything (fungi + proteingym + contacts)
     python bin/downloads.py fungi        # just the training set  -> data/fungi.fasta
     python bin/downloads.py proteingym   # just the eval data     -> data/proteingym/
+    python bin/downloads.py eukaryota [N]  # ALL eukaryotic seqs (huge!) -> data/eukaryota.fasta
 
 stdlib only (urllib + gzip + zipfile), so no curl/unzip needed. Clustering is NOT done
-here -- the Nextflow PREP stage clusters `data/fungi.fasta` at each params.cluster_ids.
+here -- the Nextflow PREP stage clusters the FASTA at each params.cluster_ids.
 """
-import gzip, json, shutil, ssl, sys, urllib.request
+import gzip, json, shutil, ssl, subprocess, sys, urllib.request
 import zipfile
 from pathlib import Path
+from urllib.parse import urlencode
 
 DATA = Path("./data")
-FUNGI_URL = ("https://rest.uniprot.org/uniprotkb/stream?compressed=true&format=fasta"
-             "&query=%28%28taxonomy_id%3A4751%29+AND+%28length%3A%5B*+TO+512%5D%29"
-             "+AND+fragment%3Afalse+AND+existence%3A%5B1+TO+3%5D%29")   # fungal, len<=512, non-fragment, PE 1-3 (~3.66M seqs)
+UNIPROT = "https://rest.uniprot.org/uniprotkb"
+STREAM_CAP = 9_000_000                    # stay under UniProt's ~10M stream limit; split queries below this
+FUNGI_URL = UNIPROT + "/stream?" + urlencode({   # fungal, len<=512, non-frag, PE 1-3 (~3.66M seqs)
+    "compressed": "true", "format": "fasta",
+    "query": "(taxonomy_id:4751) AND (length:[* TO 512]) AND fragment:false "
+             "AND (existence:1 OR existence:2 OR existence:3)"})
 PGYM_BASE = "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3"
 PGYM_ZIPS = ["DMS_ProteinGym_substitutions.zip", "zero_shot_substitutions_scores.zip"]
 AF_API = "https://alphafold.ebi.ac.uk/api/prediction/{acc}"   # returns the CURRENT pdbUrl; AFDB drops old file versions (v4->v6...), so never hardcode the version
+
+
+def _gz_complete(path):                    # a gzip is only complete if it reads to a valid end-of-stream trailer
+    try:
+        return subprocess.run(["gzip", "-t", str(path)], capture_output=True).returncode == 0
+    except FileNotFoundError:              # no gzip CLI -> verify by fully decompressing in python
+        try:
+            with gzip.open(path, "rb") as f:
+                while f.read(1 << 22):
+                    pass
+            return True
+        except (OSError, EOFError):
+            return False
 
 
 def fetch(url, dest):                      # normal TLS; fall back to unverified only if the CA bundle is broken
@@ -44,6 +62,77 @@ def fungi():
             shutil.copyfileobj(f, g)
     n = sum(line.startswith(">") for line in open(raw))
     print(f"fungi -> {raw}  ({n} proteins; clustering happens in the PREP pipeline stage)\n")
+
+
+def _euk_q(lo, hi):                        # same filter as fungi(), but taxon 2759 (Eukaryota) and an explicit length window
+    # note: `existence` takes individual values, NOT a range ([1 TO 3] is rejected by the API)
+    return (f"(taxonomy_id:2759) AND (length:[{lo} TO {hi}]) AND fragment:false "
+            f"AND (existence:1 OR existence:2 OR existence:3)")
+
+
+def _count(q):                            # UniProt returns the match count in the x-total-results header
+    url = f"{UNIPROT}/search?" + urlencode({"query": q, "format": "list", "size": 0})
+    try:
+        with urllib.request.urlopen(url) as r:
+            return int(r.headers.get("x-total-results", 0))
+    except urllib.error.URLError as e:
+        if "CERTIFICATE" not in str(e).upper():
+            raise
+        with urllib.request.urlopen(url, context=ssl._create_unverified_context()) as r:
+            return int(r.headers.get("x-total-results", 0))
+
+
+def _windows(lo, hi):                     # recursively halve the length range until each window is under the stream cap
+    n = _count(_euk_q(lo, hi))
+    if n <= STREAM_CAP or lo >= hi:
+        if n > STREAM_CAP:                # a single length with >cap seqs -> stream truncates (won't happen for len<=512 eukaryota)
+            print(f"[warn] length {lo}-{hi}: {n:,} > cap, stream will truncate")
+        return [(lo, hi, n)]
+    mid = (lo + hi) // 2
+    return _windows(lo, mid) + _windows(mid + 1, hi)
+
+
+def eukaryota(cap_seqs=None):
+    """ALL eukaryotic (taxon 2759) sequences, filtered exactly like fungi() (len<=512, non-fragment, PE 1-3),
+    downloaded as length-window batches under UniProt's ~10M stream cap and concatenated -> data/eukaryota.fasta.
+    ~15.8M sequences / ~15 GB. Pass N to cap the joined output at ~N sequences. Windows are cached and their
+    gzip integrity is checked, so a truncated part is re-downloaded automatically -- an interrupted run just
+    resumes on re-run."""
+    DATA.mkdir(parents=True, exist_ok=True)
+    parts = DATA / "eukaryota_parts"; parts.mkdir(exist_ok=True)
+    out = DATA / "eukaryota.fasta"
+    windows = _windows(1, 512)
+    total = sum(n for *_, n in windows)
+    print(f"[plan]  {len(windows)} length windows, ~{total:,} sequences total")
+    got, part_files = 0, []
+    for lo, hi, n in windows:
+        gz = parts / f"euk_{lo:04d}_{hi:04d}.fasta.gz"
+        if gz.exists() and not _gz_complete(gz):          # a prior run left this part truncated -> don't trust it
+            print(f"[bad]   {gz.name} is truncated -> re-downloading"); gz.unlink()
+        fetch(f"{UNIPROT}/stream?" + urlencode({"compressed": "true", "format": "fasta", "query": _euk_q(lo, hi)}), gz)
+        if not _gz_complete(gz):                          # the UniProt stream dropped mid-download
+            gz.unlink()
+            sys.exit(f"[error] {gz.name} came down truncated (stream dropped). Just re-run to retry this window.")
+        part_files.append(gz); got += n
+        if cap_seqs and got >= cap_seqs:
+            print(f"[cap]   ~{got:,} sequences downloaded, stopping (cap {cap_seqs:,})"); break
+    print(f"[join]  {len(part_files)} parts -> {out}")
+    written = 0
+    with open(out, "w") as g:
+        for gz in part_files:
+            with gzip.open(gz, "rt") as f:
+                if cap_seqs is None:
+                    shutil.copyfileobj(f, g); continue
+                for line in f:
+                    if line.startswith(">"):
+                        if written >= cap_seqs:
+                            break
+                        written += 1
+                    g.write(line)
+            if cap_seqs and written >= cap_seqs:
+                break
+    n = sum(line.startswith(">") for line in open(out))
+    print(f"eukaryota -> {out}  ({n:,} sequences; clustering happens in the PREP pipeline stage)\n")
 
 
 def proteingym():
@@ -107,15 +196,18 @@ def contacts(n=300):
 
 
 def main():
-    which = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if which not in ("fungi", "proteingym", "contacts", "all"):
-        sys.exit("usage: python bin/downloads.py [fungi|proteingym|contacts|all]")
+    args = sys.argv[1:]
+    which = args[0] if args else "all"
+    if which not in ("fungi", "proteingym", "contacts", "eukaryota", "all"):
+        sys.exit("usage: python bin/downloads.py [fungi|proteingym|contacts|eukaryota|all]")
     if which in ("fungi", "all"):
         fungi()
     if which in ("proteingym", "all"):
         proteingym()
     if which in ("contacts", "all"):
         contacts()
+    if which == "eukaryota":              # opt-in only -- NOT part of `all` (it's ~100M+ sequences)
+        eukaryota(cap_seqs=int(args[1]) if len(args) > 1 else None)
 
 
 if __name__ == "__main__":
