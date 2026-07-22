@@ -71,6 +71,14 @@ def score_all(cache, vocab, wt, mutants):
     return scores
 
 
+def taxon_ids(ref_csv, taxa):
+    """DMS_ids whose taxon is in `taxa` (from ProteinGym's DMS_substitutions.csv reference file).
+    taxa e.g. ['Human','Eukaryote'] -> all eukaryote-related assays (excludes Prokaryote, Virus).
+    Use INSTEAD of a filename substring --match when you want a principled, organism-labelled eval set."""
+    want = {t.strip().lower() for t in taxa}
+    return {r["DMS_id"] for r in csv.DictReader(open(ref_csv)) if r.get("taxon", "").lower() in want}
+
+
 def load_panel(dms_dir, match=None, max_len=1024):
     """Parse a few DMS csvs ONCE -> [(assay, wt, mutants, dms)], reused every eval during training.
     ponytail: keep this panel DISJOINT from the assays REPORT scores on, else you select on your test set."""
@@ -143,7 +151,11 @@ def demo():                                   # invariants: identity mutation sc
     nll = wt_nll(cache, vocab, seqs[0])                                # bell-curve x-axis
     assert nll >= 0, f"wt-NLL is a mean negative-log-prob, must be >= 0, got {nll}"
     assert isinstance(blosum_correlation_unigram(["AAAACDEFG", "ACDEFGHIK", "LMNPQRSTV"], vocab), float)
-    print(f"demo OK (identity=0, WT reconstructs, panel spearman {sp:.3f}, wt-NLL {nll:.3f})")
+    import tempfile                                                    # taxon filter: keep eukaryote-related, drop prokaryote
+    tf = Path(tempfile.mkdtemp()) / "ref.csv"
+    tf.write_text("DMS_id,taxon\nA_HUMAN,Human\nB_YEAST,Eukaryote\nC_ECOLI,Prokaryote\n")
+    assert taxon_ids(tf, ["Human", "Eukaryote"]) == {"A_HUMAN", "B_YEAST"}, "taxon filter must keep euk, drop prok"
+    print(f"demo OK (identity=0, WT reconstructs, panel spearman {sp:.3f}, wt-NLL {nll:.3f}, taxon filter OK)")
 
 
 def main():
@@ -152,6 +164,8 @@ def main():
     p.add_argument("--dms"); p.add_argument("--dms_dir")
     p.add_argument("--names"); p.add_argument("--max_len", type=int, default=1024)
     p.add_argument("--match", help="comma-sep substrings; keep only assays whose filename contains one (e.g. YEAST,RHOTO,LIPST)")
+    p.add_argument("--taxon", help="comma-sep ProteinGym taxa to keep (Human,Eukaryote,Prokaryote,Virus); reads --ref. Use INSTEAD of --match for a taxon-labelled eval set")
+    p.add_argument("--ref", help="ProteinGym DMS_substitutions.csv (taxon labels); defaults to <dms_dir>/DMS_substitutions.csv")
     p.add_argument("--exclude", help="comma-sep substrings; DROP assays whose filename contains one (e.g. the held-out dev panel)")
     p.add_argument("--baseline", help="comma-sep precomputed score columns to also Spearman (e.g. ESM2_8M) -- needs the zero-shot-scores CSVs")
     p.add_argument("--out", default="proteingym_results.csv")
@@ -168,6 +182,10 @@ def main():
         models[name] = m; vocab = vocab or v
 
     files = [Path(a.dms)] if a.dms else sorted(Path(a.dms_dir).glob("*.csv"))
+    if a.taxon:                                                     # taxon-labelled eval set (eukaryotic model); reads the reference csv
+        ref = a.ref or (Path(a.dms_dir) / "DMS_substitutions.csv")
+        ids = taxon_ids(ref, a.taxon.split(","))
+        files = [f for f in files if f.stem in ids]
     if a.match:                                                     # e.g. --match YEAST,RHOTO,LIPST for the fungal subset
         pats = [s.lower() for s in a.match.split(",")]
         files = [f for f in files if any(s in f.stem.lower() for s in pats)]

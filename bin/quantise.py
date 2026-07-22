@@ -38,6 +38,59 @@ def fake_quantize_(model,bits):
             m.weight.data=fake_quant_weight(m.weight.data,bits)
     return model
 
+
+# GPTQ (Frantar et al. 2023): error-compensated PTQ. Quantise each Linear column-by-column, propagating
+# each column's rounding error into the not-yet-quantised columns via the inverse input-Hessian. Same
+# per-output-channel grid as RTN -> RTN-vs-GPTQ is apples-to-apples (only the assignment differs).
+# ponytail: one-pass fp calibration (all Hessians from the fp model), not the full sequential recompute.
+#   upgrade path if the int2 recovery underwhelms: re-derive activations after each quantised layer.
+
+@torch.no_grad()
+def collect_hessians(model,loader,n_batches=16):
+    H={}; hooks=[]
+    def mk(name):
+        def hook(mod,inp,out):
+            x=inp[0].reshape(-1,inp[0].shape[-1]).float()          # [tokens, in_features]
+            H[name]=H.get(name,torch.zeros(x.shape[1],x.shape[1],device=x.device))+x.t()@x
+        return hook
+    for name,m in model.named_modules():
+        if isinstance(m,nn.Linear):
+            hooks.append(m.register_forward_hook(mk(name)))
+    for i,(x,y,attn) in enumerate(loader):
+        model(x.to(device),attn.to(device).bool())
+        if i+1>=n_batches: break
+    for h in hooks: h.remove()
+    return H
+
+def _gptq_layer(W,H,bits,damp=0.01):
+    W=W.clone().float(); out_ch,in_ch=W.shape
+    qmax=2**(bits-1)-1
+    scale=(W.abs().amax(dim=1)/qmax).clamp(min=1e-8)                # [out], per-channel, from ORIGINAL W (== RTN grid)
+    H=H.clone().float(); idx=torch.arange(in_ch,device=H.device)
+    dead=torch.diag(H)==0; H[dead,dead]=1.0; W[:,dead]=0.0         # unused input dims -> don't quantise
+    U=None
+    for k in (damp,damp*10,damp*100):                              # bump damping until H is PD
+        Hd=H.clone(); Hd[idx,idx]+=k*torch.diag(H).mean()
+        try: U=torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(Hd)),upper=True); break
+        except RuntimeError: U=None
+    if U is None:                                                  # numerically hopeless -> plain RTN
+        return torch.clamp(torch.round(W/scale.unsqueeze(1)),-qmax,qmax)*scale.unsqueeze(1)
+    Q=torch.zeros_like(W)
+    for i in range(in_ch):
+        w=W[:,i]
+        q=torch.clamp(torch.round(w/scale),-qmax,qmax)*scale       # quantise column i on the per-row grid
+        Q[:,i]=q
+        err=(w-q)/U[i,i]
+        W[:,i:]-=torch.outer(err,U[i,i:])                          # push the error onto the remaining columns
+    return Q
+
+@torch.no_grad()
+def gptq_quantize_(model,bits,hessians):
+    for name,m in model.named_modules():
+        if isinstance(m,nn.Linear) and name in hessians:
+            m.weight.data=_gptq_layer(m.weight.data,hessians[name],bits).to(m.weight.dtype)
+    return model
+
 def metrics(model,loader,vocab,test_seqs,fp_emb):
     e=evaluate(model,loader,vocab)
     b=biochemical_breakdown(model,loader,vocab)
@@ -68,6 +121,8 @@ def check():
     assert not torch.equal(net[0].weight,w0), "quantize_layer_ did not change its target"
     X=torch.randn(50,8); Q,_=torch.linalg.qr(torch.randn(8,8))   # CKA must be 1 for a rotated copy
     assert abs(_cka(X,X)-1)<1e-4 and abs(_cka(X,X@Q)-1)<1e-4, "linear CKA must be rotation-invariant"
+    W=torch.randn(6,8)                                           # GPTQ with an identity Hessian must reduce to plain per-channel RTN
+    assert torch.allclose(fake_quant_weight(W.clone(),4),_gptq_layer(W.clone(),torch.eye(8),4),atol=1e-5), "GPTQ(H=I) must equal RTN"
 
 def sweep(ckpt):
     model,vocab=load_checkpoint(ckpt,device)
@@ -82,7 +137,28 @@ def sweep(ckpt):
     rows={"fp":metrics(model,loader,vocab,test_seqs,fp_emb)}
     for bits in BITS:
         rows[f"int{bits}"]=metrics(fake_quantize_(copy.deepcopy(model),bits),loader,vocab,test_seqs,fp_emb)
-    return {"checkpoint":ckpt,"params_M":nparams,"results":rows}
+    return {"checkpoint":ckpt,"dataset":model.arch.get("dataset","?"),"params_M":nparams,"results":rows}
+
+def gptq_sweep(ckpt):
+    # RTN vs GPTQ at each bit-width (Linear-only, same as sweep) -> does error compensation recover the int2 cliff?
+    model,vocab=load_checkpoint(ckpt,device)
+    nparams=sum(p.numel() for p in model.parameters())/1e6
+    seqs=load_sequences(ModelArgs.data_file,ModelArgs.length_cutoff)
+    _,_,te=random_split(len(seqs),ModelArgs.split_ratios,ModelArgs.split_seed)
+    test_seqs=[seqs[i] for i in te[:TEST_SIZE]]
+    loader=DataLoader(precompute(test_seqs,ModelArgs.eval_mask_seed+1,vocab),
+        batch_size=ModelArgs.batch_size,shuffle=False,collate_fn=partial(pad_batch,vocab=vocab))
+    fp_emb=embed(model,test_seqs,vocab)
+    H=collect_hessians(model,loader)                                   # calibration Hessians from fp activations
+    rows={"fp":metrics(model,loader,vocab,test_seqs,fp_emb)}
+    for bits in BITS:
+        rows[f"rtn_int{bits}"]=metrics(fake_quantize_(copy.deepcopy(model),bits),loader,vocab,test_seqs,fp_emb)
+        rows[f"gptq_int{bits}"]=metrics(gptq_quantize_(copy.deepcopy(model),bits,H),loader,vocab,test_seqs,fp_emb)
+    print(f"\n=== RTN vs GPTQ (Linear-only PTQ): {ckpt}  (fp top1 {rows['fp']['top1']:.2f}) ===")
+    print(f"{'variant':14}{'top1':>8}{'ppl':>9}{'blosum':>9}{'emb_cos':>9}")
+    for name,r in rows.items():
+        print(f"{name:14}{r['top1']:>8.2f}{r['ppl']:>9.3f}{r['blosum_spearman']:>9.3f}{r['emb_cos_vs_fp']:>9.3f}")
+    return {"checkpoint":ckpt,"dataset":model.arch.get("dataset","?"),"params_M":nparams,"method":"rtn_vs_gptq","results":rows}
 
 def quantize_layer_(model,name,bits):   # quantize ONE named layer's weight in place
     for n,m in model.named_modules():
@@ -188,6 +264,7 @@ def main():
     p.add_argument("--keep",help="comma-sep layer names to protect at --keep_bits while the rest go to --bits (mixed precision)")
     p.add_argument("--keep_bits",type=int,default=8,help="bit-width for the protected layers")
     p.add_argument("--emb_cos_vs",help="reference fp checkpoint: report pooled-embedding cosine vs it (did QAT keep the geometry?)")
+    p.add_argument("--gptq",action="store_true",help="RTN vs GPTQ (error-compensated PTQ) across bit-widths -> gptq_results.json")
     a=p.parse_args()
     if a.data_file: ModelArgs.data_file=a.data_file
     if a.out_dir: ModelArgs.out_dir=a.out_dir
@@ -208,6 +285,12 @@ def main():
     if a.emb_cos_vs is not None:
         allres=[emb_cos_vs(c,a.emb_cos_vs) for c in ckpts]
         out=Path(ModelArgs.out_dir)/"emb_cos_results.json"
+        out.write_text(json.dumps(allres,indent=2))
+        print(f"saved -> {out}")
+        return
+    if a.gptq:
+        allres=[gptq_sweep(c) for c in ckpts]
+        out=Path(ModelArgs.out_dir)/"gptq_results.json"
         out.write_text(json.dumps(allres,indent=2))
         print(f"saved -> {out}")
         return

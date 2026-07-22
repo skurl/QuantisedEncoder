@@ -22,6 +22,7 @@ FUNGI_URL = UNIPROT + "/stream?" + urlencode({   # fungal, len<=512, non-frag, P
              "AND (existence:1 OR existence:2 OR existence:3)"})
 PGYM_BASE = "https://marks.hms.harvard.edu/proteingym/ProteinGym_v1.3"
 PGYM_ZIPS = ["DMS_ProteinGym_substitutions.zip", "zero_shot_substitutions_scores.zip"]
+PGYM_REF = "https://raw.githubusercontent.com/OATML-Markslab/ProteinGym/main/reference_files/DMS_substitutions.csv"   # per-assay taxon labels (Human/Eukaryote/Prokaryote/Virus) -> the --taxon eval set
 AF_API = "https://alphafold.ebi.ac.uk/api/prediction/{acc}"   # returns the CURRENT pdbUrl; AFDB drops old file versions (v4->v6...), so never hardcode the version
 
 
@@ -144,7 +145,9 @@ def proteingym():
         print(f"[unzip] {z} -> {sub.name}/")
         with zipfile.ZipFile(zp) as zf:
             zf.extractall(sub)
-    print(f"proteingym -> {out}/  (DMS assays + ESM2-8M baseline scores)\n")
+    # taxon labels, dropped INTO the scored dir so the Nextflow REPORT stage stages it alongside the assays
+    fetch(PGYM_REF, out / "zero_shot_substitutions_scores" / "DMS_substitutions.csv")
+    print(f"proteingym -> {out}/  (DMS assays + ESM2-8M baseline scores + taxon reference)\n")
 
 
 def _accessions(fasta, n):

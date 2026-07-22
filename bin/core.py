@@ -18,6 +18,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 class ModelArgs:
     out_dir = "./outputs"
     data_file = "./data/fungi.fasta"    # pipeline overrides via --data_file
+    dataset = "fungi"                    # corpus name; baked into arch so a loose .pth self-describes. New corpus = one registry entry + a downloads fn.
     length_cutoff = 512
     split_ratios = (0.8, 0.1, 0.1)
     split_seed = 1234
@@ -38,6 +39,7 @@ class ModelArgs:
     grad_accum = 4
     warmup_steps = 500
     min_lr_ratio = 0.1
+    decay_frac = 0.33         # WSD schedule: fraction of total steps spent in the final decay phase (ESMC uses ~1/3); the rest is warmup + a stable phase at peak LR
     use_ema = False
     ema_decay = 0.999
     amp = True
@@ -297,7 +299,7 @@ class Transformer(nn.Module):
 def build_arch(vocab):
     return {"vocab_size": len(vocab.aa_vocab), "d_model": ModelArgs.d_model, "num_heads": ModelArgs.num_heads,
             "num_layers": ModelArgs.num_layers, "d_ff": ModelArgs.d_ff, "dropout": ModelArgs.dropout,
-            "num_classes": vocab.num_classes, "pad_idx": vocab.pad}
+            "num_classes": vocab.num_classes, "pad_idx": vocab.pad, "dataset": ModelArgs.dataset}
 
 
 # QUANTISATION-AWARE TRAINING  (weight-only, per-channel symmetric RTN with straight-through backward)

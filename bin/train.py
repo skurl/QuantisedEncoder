@@ -22,12 +22,18 @@ def wlog(data, step=None):   # no-op when there's no active run (disabled mode /
         wandb.log(data, step=step)
 
 
-def make_scheduler(opt, warmup, total, min_ratio):
+def make_scheduler(opt, warmup, total, min_ratio, decay_frac=0.33):
+    # Warmup-Stable-Decay (ESMC): linear warmup -> constant peak through the stable phase -> cosine
+    # decay over the last `decay_frac` of steps down to min_ratio. Decouples training length from the
+    # schedule: hold the stable phase as long as you like, then decay-branch to a usable checkpoint.
+    decay_start = int(total * (1 - decay_frac))
     def lr_lambda(step):
         if step < warmup:
             return (step + 1) / max(1, warmup)
-        prog = (step - warmup) / max(1, total - warmup)
-        return max(min_ratio, 0.5 * (1 + math.cos(math.pi * prog)))
+        if step < decay_start:
+            return 1.0                                             # stable phase at peak LR
+        prog = (step - decay_start) / max(1, total - decay_start)
+        return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
     return optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
 
@@ -37,7 +43,7 @@ def train(model, train_loader, val_loader, vocab, seed, teacher=None, tok=None, 
     crit = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=ModelArgs.label_smoothing)
     params = list(model.parameters()) + (list(proj.parameters()) if proj is not None else [])
     opt = optim.AdamW(params, lr=ModelArgs.learning_rate, weight_decay=ModelArgs.weight_decay)
-    sched = make_scheduler(opt, ModelArgs.warmup_steps, ModelArgs.max_steps, ModelArgs.min_lr_ratio)
+    sched = make_scheduler(opt, ModelArgs.warmup_steps, ModelArgs.max_steps, ModelArgs.min_lr_ratio, ModelArgs.decay_frac)
     ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ModelArgs.ema_decay)) if ModelArgs.use_ema else None
     specials = torch.tensor([vocab.cls, vocab.eos, vocab.pad, vocab.mask, vocab.unk], device=device)
 
@@ -94,7 +100,7 @@ def train(model, train_loader, val_loader, vocab, seed, teacher=None, tok=None, 
                 if improved:
                     best_score = score
                     best_state = copy.deepcopy(em.state_dict())
-                    save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", em, vocab)
+                    save_checkpoint(Path(ModelArgs.out_dir) / f"best_{ModelArgs.dataset}_s{seed}.pth", em, vocab)
                 wlog(logs, global_step)
                 print(f"  [eval {global_step}] ppl {val['perplexity']:.3f} | top1 {val['top1']:.2f}% "
                       f"| best-on-{metric} {'*' if improved else ''}")
@@ -190,7 +196,7 @@ def main():
     model = train(model, train_loader, val_loader, vocab, seed, teacher, tok, proj, panel)
     if ModelArgs.qat_bits:                                        # collapse fake-quant -> weights hold the int values
         bake_qat(model)
-    save_checkpoint(Path(ModelArgs.out_dir) / f"best_seed{seed}.pth", model, vocab)   # always emit the ckpt Nextflow expects
+    save_checkpoint(Path(ModelArgs.out_dir) / f"best_{ModelArgs.dataset}_s{seed}.pth", model, vocab)   # always emit the ckpt Nextflow expects (name carries the dataset)
 
     tm = evaluate(model, test_loader, vocab)
     bio = biochemical_breakdown(model, test_loader, vocab)
@@ -207,10 +213,10 @@ def main():
                               "baseline/unigram_top1": base["top1"], "baseline/unigram_ppl": base["perplexity"]})
     wandb.finish()   # checkpoint is captured by Nextflow publishDir; no wandb artifact needed (and its staging dir is read-only on compute nodes)
 
-    with open(Path(ModelArgs.out_dir) / f"results_seed{seed}.json", "w") as fh:
-        json.dump({"baseline": base, "test": tm, "biochemistry": bio, "blosum": blosum,
+    with open(Path(ModelArgs.out_dir) / f"results_{ModelArgs.dataset}_s{seed}.json", "w") as fh:
+        json.dump({"dataset": ModelArgs.dataset, "baseline": base, "test": tm, "biochemistry": bio, "blosum": blosum,
                    "blosum_null": blosum_null, "config": cfg}, fh, indent=2)
-    print(f"Saved best_seed{seed}.pth and results_seed{seed}.json to {ModelArgs.out_dir}")
+    print(f"Saved best_{ModelArgs.dataset}_s{seed}.pth and results_{ModelArgs.dataset}_s{seed}.json to {ModelArgs.out_dir}")
 
 
 if __name__ == "__main__":
