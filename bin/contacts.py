@@ -81,13 +81,16 @@ def pairs(feats, contacts, valid, sep):
     return feats[ii, jj], contacts[ii, jj].astype(np.float32)
 
 
-def fit_probe(X, y, steps=400, lr=0.05):
-    """Logistic regression F -> 1. No sklearn: nn.Linear + BCE, positives up-weighted (contacts are sparse)."""
+def fit_probe(X, y, steps=400, lr=0.05, seed=0, weight_decay=1e-3):
+    """Logistic regression F -> 1. No sklearn: nn.Linear + BCE, positives up-weighted (contacts are sparse).
+    L2 (weight_decay) curbs overfit on the limited pooled pairs; a fixed seed makes the fit reproducible so
+    several seeds can be averaged -> the per-layer profile stops jittering run to run."""
+    torch.manual_seed(seed)
     X = torch.tensor(X, dtype=torch.float32, device=device)
     y = torch.tensor(y, dtype=torch.float32, device=device)
     pos = y.sum().clamp(min=1)
     lin = nn.Linear(X.shape[1], 1).to(device)
-    opt = torch.optim.Adam(lin.parameters(), lr=lr)
+    opt = torch.optim.Adam(lin.parameters(), lr=lr, weight_decay=weight_decay)
     lossf = nn.BCEWithLogitsLoss(pos_weight=(len(y) - pos) / pos)
     for _ in range(steps):
         opt.zero_grad()
@@ -157,24 +160,27 @@ def evaluate(model, vocab, pdb_dir, min_plddt=70.0, max_len=1024):
 
     Xtr = np.concatenate([pairs(*data[n], sep=6)[0] for n in tr])
     ytr = np.concatenate([pairs(*data[n], sep=6)[1] for n in tr])
-    full = fit_probe(Xtr, ytr)
-    per_layer = [fit_probe(Xtr[:, l * H:(l + 1) * H], ytr) for l in range(n_layers)]   # H features each
+    K = 3                                                          # average the probe over K inits -> de-noises the (previously unstable) per-layer profile
+    full = [fit_probe(Xtr, ytr, seed=k) for k in range(K)]
+    per_layer = [[fit_probe(Xtr[:, l * H:(l + 1) * H], ytr, seed=k) for k in range(K)] for l in range(n_layers)]
 
     res = {"n_train": len(tr), "n_test": len(te), "n_layers": n_layers, "p_at_L": [], "p_at_L_LR": [],
            "random_L": [], "random_LR": [], "per_layer_p_at_L": [[] for _ in range(n_layers)]}
     for n in te:
         feats, contacts, valid = data[n]
-        s = probe_scores(full, feats)
+        s = np.mean([probe_scores(f, feats) for f in full], 0)     # seed-averaged contact scores
         res["p_at_L"].append(precision_at_L(s, contacts, valid, 6))
         res["p_at_L_LR"].append(precision_at_L(s, contacts, valid, 24))
         res["random_L"].append(base_rate(contacts, valid, 6))
         res["random_LR"].append(base_rate(contacts, valid, 24))
         for l in range(n_layers):
-            sl = probe_scores(per_layer[l], feats[:, :, l * H:(l + 1) * H])
+            sl = np.mean([probe_scores(per_layer[l][k], feats[:, :, l * H:(l + 1) * H]) for k in range(K)], 0)
             res["per_layer_p_at_L"][l].append(precision_at_L(sl, contacts, valid, 6))
 
     mean = lambda xs: float(np.nanmean(xs)) if xs else float("nan")
-    return {"p_at_L": mean(res["p_at_L"]), "p_at_L_LR": mean(res["p_at_L_LR"]),
+    std  = lambda xs: float(np.nanstd(xs)) if xs else float("nan")   # spread across test proteins -> an error bar on the faint signal
+    return {"p_at_L": mean(res["p_at_L"]), "p_at_L_std": std(res["p_at_L"]),
+            "p_at_L_LR": mean(res["p_at_L_LR"]), "p_at_L_LR_std": std(res["p_at_L_LR"]),
             "p_at_L_random": mean(res["random_L"]), "p_at_L_LR_random": mean(res["random_LR"]),
             "per_layer_p_at_L": [mean(v) for v in res["per_layer_p_at_L"]],
             "n_train": res["n_train"], "n_test": res["n_test"]}
@@ -226,8 +232,8 @@ def main():
     model, vocab = load_checkpoint(a.ckpt, device); model.eval()
     res = evaluate(model, vocab, a.pdb_dir, a.min_plddt, a.max_len)
     Path(a.out).write_text(json.dumps(res, indent=2))
-    print(f"P@L-LR {res['p_at_L_LR']:.3f} (random {res['p_at_L_LR_random']:.3f})  |  "
-          f"P@L {res['p_at_L']:.3f} (random {res['p_at_L_random']:.3f})  "
+    print(f"P@L-LR {res['p_at_L_LR']:.3f}±{res['p_at_L_LR_std']:.3f} (random {res['p_at_L_LR_random']:.3f})  |  "
+          f"P@L {res['p_at_L']:.3f}±{res['p_at_L_std']:.3f} (random {res['p_at_L_random']:.3f})  "
           f"(train {res['n_train']} / test {res['n_test']})")
     print("per-layer P@L:", " ".join(f"{v:.3f}" for v in res["per_layer_p_at_L"]))
     print(f"saved -> {a.out}")

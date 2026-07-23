@@ -1,27 +1,3 @@
-"""Per-layer TUNED-LENS NLL probe -- localise where the masked-LM calibration signal lives.
-
-Freeze a backbone, fit a small (LayerNorm + Linear) readout head on EACH layer's hidden state
-(fungal train split), then measure per-layer masked-LM NLL / perplexity on the test split (and any
-extra sequences -- e.g. ubiquitin). Run on the trained checkpoint AND a fresh untrained model of
-identical arch as a negative control (a true fresh __init__, not shuffled weights).
-
-Why a tuned lens, not a shared final head (naive "logit lens"): the readout is TRAINED in both the
-trained- and untrained-backbone arms, so the untrained control is meaningful. A shared final head
-applied to a random backbone just yields ~uniform NLL (log 20 ~= 3.0) at every layer -- a vacuous
-control that can't tell "emergent representation" from "the head can't read random features". Here,
-if a probe on the UNTRAINED backbone's layer-k features already reaches low NLL, the effect is
-superficial (architecture + trained readout), not a learned property -- which is the open question.
-
-Note: the ~1.2 Hou et al. band is defined for the model's FINAL-layer output likelihood; on
-intermediate layers the tuned-lens NLL is a related-but-different quantity, so the band is drawn as
-a final-layer REFERENCE line, not a literal "this layer is in the fitness zone" claim.
-
-    python bin/layerwise.py results/0.5_best_s123/best_seed123.pth \
-        --data_file data/dataset_0.5.fasta --seqs data/ubiquitin.fasta \
-        --out results/layerwise_s123.json --fig results/layerwise_s123.png
-    python bin/layerwise.py <ckpt> --data_file <fasta> --quant int8,int4,int2   # add PTQ variants
-    python bin/layerwise.py --check                                             # self-test, no data/ckpt
-"""
 import argparse, copy, json, math
 from functools import partial
 from pathlib import Path
@@ -35,8 +11,6 @@ from core import (ModelArgs, device, load_checkpoint, load_sequences,
 
 
 def layer_hiddens(model, x, attn):
-    """Residual-stream hidden state at each depth: [embedding, after block 1, ..., after block N].
-    Length = num_layers + 1. Backbone runs under no_grad; the caller's probe heads carry the grad."""
     with torch.no_grad():
         h = model.dropout(model.embed(x))          # dropout is a no-op in eval; kept to mirror forward()
         hs = [h]
@@ -53,7 +27,6 @@ def make_heads(n_points, d_model, n_classes):
 
 
 def fit_probes(model, loader, vocab, steps, lr=1e-3):
-    """Fit one readout head per layer on the (frozen) backbone. Returns the trained heads."""
     model.eval()
     d, C = model.arch["d_model"], vocab.num_classes
     heads = make_heads(model.arch["num_layers"] + 1, d, C)
@@ -168,6 +141,27 @@ def plot(out, path, extra):
     print(f"saved -> {path}")
 
 
+def overlay(paths, figpath):
+    """Replot several existing layerwise JSONs on one axis (e.g. fungal vs eukaryotic). No compute."""
+    try:
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    except ImportError:
+        print("[fig] matplotlib not available -> skipped"); return
+    fig, ax = plt.subplots(figsize=(7.5, 4.5)); band = 1.2
+    for p in paths:
+        d = json.loads(Path(p).read_text()); band = d.get("hou_band", band)
+        tag = d.get("dataset", Path(p).stem)
+        for name, res in d["variants"].items():
+            for split, curve in res.items():
+                xs = [r["layer"] for r in curve]
+                ax.plot(xs, [r["nll"] for r in curve], marker="o",
+                        ls="-" if split == "test" else "--", label=f"{tag}:{name}:{split}")
+    ax.axhline(band, color="grey", ls=":", lw=1)
+    ax.set_xlabel("layer (0 = embedding output)"); ax.set_ylabel("tuned-lens masked-LM NLL")
+    ax.set_title("Per-layer NLL — overlay"); ax.legend(fontsize=7)
+    fig.tight_layout(); fig.savefig(figpath, dpi=140); print(f"saved -> {figpath}")
+
+
 def check():
     """Self-test on random data: probe FITS (loss drops), NLL is finite, and a probe on a backbone
     fed real signal beats one on pure noise. No checkpoint or data needed."""
@@ -197,10 +191,13 @@ def main():
     p.add_argument("--probe_steps", type=int, default=500, help="optimizer steps to fit the readout heads")
     p.add_argument("--out", default="layerwise.json")
     p.add_argument("--fig", help="write a per-layer NLL line plot here (PNG); needs matplotlib")
+    p.add_argument("--overlay", help="comma-sep existing layerwise JSONs to replot together (e.g. fungal vs euk); needs --fig")
     p.add_argument("--check", action="store_true", help="run the self-test and exit")
     a = p.parse_args()
     if a.check:
         check(); return
+    if a.overlay:
+        overlay(a.overlay.split(","), a.fig or "overlay.png"); return
     if not a.checkpoint or not a.data_file:
         p.error("checkpoint and --data_file are required (or use --check)")
     run(a)

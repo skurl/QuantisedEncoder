@@ -47,7 +47,7 @@ process TRAIN {
     python ${projectDir}/bin/train.py \
         --data_file ${data} --dataset ${params.dataset} --out_dir . \
         --d_model ${size.d} --num_heads ${size.h} --num_layers ${size.l} --d_ff ${size.ff} \
-        --seed ${seed} --max_steps ${params.max_steps} --eval_every ${params.eval_every} \
+        --seed ${seed} --max_steps ${params.max_steps} --eval_every ${params.eval_every} --ckpt_every ${params.ckpt_every} \
         --run_name ${id} --wandb_group ${params.dataset}_${cid}_${size.tag} \
         ${distill} ${panel}
     """

@@ -106,6 +106,10 @@ def train(model, train_loader, val_loader, vocab, seed, teacher=None, tok=None, 
                       f"| best-on-{metric} {'*' if improved else ''}")
                 model.train()                                    # back to train mode after eval
 
+            if ModelArgs.ckpt_every and global_step % ModelArgs.ckpt_every == 0:   # periodic snapshot for step-sweep analyses
+                save_checkpoint(Path(ModelArgs.out_dir) / f"step{global_step}_{ModelArgs.dataset}_s{seed}.pth",
+                                ema.module if ema else model, vocab)
+
             if global_step >= ModelArgs.max_steps:
                 break
 

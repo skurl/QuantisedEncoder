@@ -32,6 +32,7 @@ class ModelArgs:
     length_batching = True    # group similar-length sequences per batch -> less padding waste
     max_steps = 5000
     eval_every = 250          # eval + checkpoint cadence, in optimizer steps
+    ckpt_every = 0            # >0 = also snapshot step<N>_<dataset>_s<seed>.pth every N steps -> NLL-vs-step / quant-tolerance-vs-step curves from ONE run
     learning_rate = 5.54e-4   # sweep ni3jx7oo best config
     weight_decay = 0.1
     label_smoothing = 0.05
